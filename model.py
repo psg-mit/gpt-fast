@@ -53,6 +53,11 @@ class ModelArgs:
 transformer_configs = {
     "gemma-2b": dict(dim=2048, vocab_size=256000, n_layer=18, n_head=8, n_local_heads=1, intermediate_size=16384),
     "gemma-7b": dict(dim=3072, vocab_size=256000, n_layer=28, n_head=16, n_local_heads=16, intermediate_size=24576, head_dim=256),
+    "gemma-7b-chatml": dict(dim=3072, vocab_size=256002, n_layer=28, n_head=16, n_local_heads=16, intermediate_size=24576, head_dim=256),
+    "gemma-7b-pasta": dict(dim=3072, vocab_size=256007, n_layer=28, n_head=16, n_local_heads=16, intermediate_size=24576, head_dim=256),
+    "gemma-7b-apar": dict(dim=3074, vocab_size=256004, n_layer=28, n_head=16, n_local_heads=16, intermediate_size=24576, head_dim=256),
+    "gemma-2b-it": dict(dim=2048, vocab_size=256000, n_layer=18, n_head=8, n_local_heads=1, intermediate_size=16384),
+    "gemma-7b-it": dict(dim=3072, vocab_size=256000, n_layer=28, n_head=16, n_local_heads=16, intermediate_size=24576, head_dim=256),
     "CodeLlama-7b-Python-hf": dict(block_size=16384, vocab_size=32000, n_layer=32, dim = 4096, rope_base=1000000),
     "7B": dict(n_layer=32, n_head=32, dim=4096),
     "13B": dict(n_layer=40, n_head=40, dim=5120),
@@ -103,18 +108,24 @@ class Transformer(nn.Module):
         for b in self.layers:
             b.attention.kv_cache = KVCache(max_batch_size, max_seq_length, self.config.n_local_heads, self.config.head_dim)
 
-        self.freqs_cis = precompute_freqs_cis(self.config.block_size, self.config.head_dim, self.config.rope_base)
+        self.freqs_cis = precompute_freqs_cis(10 * self.config.block_size, self.config.head_dim, self.config.rope_base)
         self.causal_mask = torch.tril(torch.ones(self.max_seq_length, self.max_seq_length, dtype=torch.bool))
 
-    def forward(self, idx: Tensor, input_pos: Optional[Tensor] = None) -> Tensor:
+    def forward(self, idx: Tensor, input_pos: Optional[Tensor] = None, 
+                mask: Optional[Tensor] = None, cache_pos: Optional[Tensor] = None) -> Tensor:
         assert self.freqs_cis is not None, "Caches must be initialized first"
-        mask = self.causal_mask[None, None, input_pos]
+
+        if mask is None:
+            mask = self.causal_mask[None, None, input_pos]
+        if cache_pos is None:
+            cache_pos = input_pos
+        
         freqs_cis = self.freqs_cis[input_pos]
         x = self.tok_embeddings(idx)
         x = (self.config.dim ** 0.5) * x
 
         for i, layer in enumerate(self.layers):
-            x = layer(x, input_pos, freqs_cis, mask)
+            x = layer(x, cache_pos, freqs_cis, mask)
         x = self.norm(x)
         logits = self.output(x)
         return logits
