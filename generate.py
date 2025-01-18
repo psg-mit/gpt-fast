@@ -4,6 +4,7 @@
 # This source code is licensed under the license found in the
 # LICENSE file in the root directory of this source tree.
 import itertools
+import re
 import sys
 import time
 import json
@@ -61,7 +62,9 @@ flags.DEFINE_string("input_file", None, "input file")
 flags.DEFINE_string("model_name", None, "model name")
 flags.DEFINE_string("output_file", None, "output file")
 flags.DEFINE_string("positional_encoding_mode", "const-40", "positional encoding mode")
+flags.DEFINE_boolean("sot", False, "Whether to use sot")
 
+MAX_BATCH_SIZE = 32
 
 def device_sync(device):
     if "cuda" in device:
@@ -114,24 +117,31 @@ def prefill(model: Transformer, x: torch.Tensor, input_pos: torch.Tensor, **samp
 
 def decode_one_token(model: Transformer, x: torch.Tensor, input_pos: torch.Tensor, **sampling_kwargs) -> Tuple[torch.Tensor, torch.Tensor]:
     # input_pos: [B, 1]
-    assert input_pos.shape[-1] == 1
+    # assert input_pos.shape[-1] == 1
     logits = model(x, input_pos)
     return sample(logits, **sampling_kwargs)
 
 def decode_n_tokens(model: Transformer, cur_token: torch.Tensor, input_pos: torch.Tensor, num_new_tokens: int, callback=lambda _: _, **sampling_kwargs):
-    new_tokens, new_probs = [], []
+    new_tokens = [cur_token.clone()]
+    is_done = [False] * cur_token.size(0)
     for i in range(num_new_tokens):
         with torch.backends.cuda.sdp_kernel(enable_flash=False, enable_mem_efficient=False, enable_math=True): # Actually better for Inductor to codegen attention here
+            is_done = [a or b[0] == 256001 for a, b in zip(is_done, cur_token.clone().tolist())]
+            # If all examples in batch reached EOS, break
+            if all(is_done):
+                break
+
             next_token, next_prob = decode_one_token(
                 model, cur_token, input_pos, **sampling_kwargs
             )
             input_pos += 1
             new_tokens.append(next_token.clone())
             callback(new_tokens[-1])
-            new_probs.append(next_prob.clone())
+            # new_probs.append(next_prob.clone())
+            
             cur_token = next_token.clone()
 
-    return new_tokens, new_probs
+    return new_tokens
 
 
 def model_forward(model, x, input_pos):
@@ -190,9 +200,9 @@ def speculative_decode(
 @torch.no_grad()
 def generate(
     model: Transformer,
+    tokenizer: SentencePieceProcessor,
     prompt: torch.Tensor,
-    max_new_tokens: int,
-    batch_size: int,
+    max_seq_len: int,
     *,
     interactive: bool,
     draft_model: Transformer,
@@ -207,92 +217,397 @@ def generate(
     is_speculative = draft_model is not None
     # create an empty tensor of the expected final shape and fill in the current tokens
     T = prompt.size(-1)
-    T_new = T + max_new_tokens
-    if interactive:
-        max_seq_length = 350
-    else:
-        max_seq_length = min(T_new, model.config.block_size)
+    num_prompt_tokens = T
+    # batch_size = prompt.size(0)
+    batch_size = MAX_BATCH_SIZE
+
+    # pad to batch size
+    if prompt.size(0) < batch_size:
+        prompt = F.pad(prompt.clone(), (0, 0, 0, batch_size - prompt.size(0)), value=tokenizer.pad_id())
+    
+    # T_new = T + max_new_tokens
+    # if interactive:
+    #     max_seq_length = 350
+    # else:
+    #     max_seq_length = min(T_new, model.config.block_size)
+
+    # print("batch_size", batch_size)
+    # print("max_seq_len", max_seq_len)
 
     device, dtype = prompt.device, prompt.dtype
-    max_seq_length = max_seq_length + speculate_k + 1 if is_speculative else max_seq_length
+    # max_seq_length = max_seq_length + speculate_k + 1 if is_speculative else max_seq_length
     with torch.device(device):
-        model.setup_caches(max_batch_size=batch_size, max_seq_length=max_seq_length)
-        if is_speculative and draft_model is not model:
-            draft_model.setup_caches(max_batch_size=batch_size, max_seq_length=max_seq_length)
+        model.setup_caches(max_batch_size=batch_size, max_seq_length=max_seq_len)
+        # if is_speculative and draft_model is not model:
+        #     draft_model.setup_caches(max_batch_size=batch_size, max_seq_length=max_seq_length)
 
     # create an empty tensor of the expected final shape and fill in the current tokens
-    empty = torch.empty(batch_size, T_new, dtype=dtype, device=device)
-    # TODO: don't repeat the prompt, should be from the input
-    prompt = prompt.view(1, -1).repeat(batch_size, 1)
+    empty = torch.ones(batch_size, max_seq_len, dtype=dtype, device=device)
     empty[:, :T] = prompt
     seq = empty
     input_pos = torch.arange(0, T, device=device)
 
-    next_token = prefill(model, prompt.view(batch_size, -1), input_pos, **sampling_kwargs)
-    if is_speculative:
-        prefill(draft_model, prompt.view(batch_size, -1), input_pos, **sampling_kwargs)
-    seq[:, T] = next_token.squeeze()
+    # print('prompt shape', prompt.shape)
+    # print("prompt", prompt.view(batch_size, -1))
+    # print("cache batch size", model.max_batch_size)
+    # print("cache seq length", model.max_seq_length)
 
+    next_token = prefill(model, prompt.view(batch_size, -1), input_pos, **sampling_kwargs).clone()
+    # print("Initial next_ids", next_token)
+    # if is_speculative:
+    #     prefill(draft_model, prompt.view(batch_size, -1), input_pos, **sampling_kwargs)
+    # seq[:, T] = next_token.squeeze()
+
+    # accept_counts = [0] * (speculate_k + 1)
+
+    # if is_speculative:
+    #     input_pos = input_pos.item()  # for speculative decoding easier to keep on host
+    #     while input_pos < T_new - 1:
+    #         cur_token = next_token.view(())
+
+    #         next_tokens = speculative_decode(
+    #             model, draft_model, cur_token, input_pos, speculate_k, **sampling_kwargs
+    #         )
+
+    #         accept_counts[len(next_tokens) - 1] += 1
+    #         num_added = min(T_new - input_pos - 1, len(next_tokens))
+    #         seq[input_pos + 1 : input_pos + num_added + 1] = next_tokens[: num_added]
+    #         for i in next_tokens[: num_added,]:
+    #             callback(i)
+    #         input_pos = input_pos + num_added
+    #         next_token = next_tokens[-1]
+    # else:
+    
     input_pos = torch.tensor([T], device=device, dtype=torch.int)
-    accept_counts = [0] * (speculate_k + 1)
 
-    if is_speculative:
-        input_pos = input_pos.item()  # for speculative decoding easier to keep on host
-        while input_pos < T_new - 1:
-            cur_token = next_token.view(())
+    max_new_tokens = max_seq_len - num_prompt_tokens - 1
+    time0 = time.time()
+    generated_ids = decode_n_tokens(model, next_token.view(batch_size, -1), input_pos, max_new_tokens - 1, callback=callback, **sampling_kwargs)
+    time1 = time.time()
 
-            next_tokens = speculative_decode(
-                model, draft_model, cur_token, input_pos, speculate_k, **sampling_kwargs
-            )
+    # print('prompt', prompt)
+    # print('generated_ids', generated_ids)
+    # seq = torch.cat([prompt, torch.cat(generated_ids, dim=-1)], dim=-1)
+    generated_ids = torch.cat(generated_ids, dim=-1)
+    n_generated = generated_ids.size(-1)
+    seq[:, T:T+n_generated] = generated_ids
+    # print('seq', seq)
 
-            accept_counts[len(next_tokens) - 1] += 1
-            num_added = min(T_new - input_pos - 1, len(next_tokens))
-            seq[input_pos + 1 : input_pos + num_added + 1] = next_tokens[: num_added]
-            for i in next_tokens[: num_added,]:
-                callback(i)
-            input_pos = input_pos + num_added
-            next_token = next_tokens[-1]
+    # print("Time to generate batch", time1 - time0)
+
+    # generate_stats = {
+    #     'accept_counts': accept_counts
+    # }
+    return seq, (generated_ids, time1-time0)
+
+# Input prompt is already in chat format, so need to preprocess it to just the prompt
+# Assumes it is in the chat template
+def preprocess_prompt(prompt: str) -> str:
+    return prompt.split("<|im_start|>user\n")[1].split("<|im_end|>")[0]
+
+def generate_outline(
+    tokenizer: SentencePieceProcessor,
+    model: Transformer, 
+    max_seq_len: int, 
+    device: str, 
+    draft_model: Transformer, 
+    speculate_k: int, 
+    interactive: bool, 
+    callback, 
+    temperature: float, 
+    top_k: int,
+    prompt: str
+) -> Tuple[torch.Tensor, int]:
+    outline_prompt = (
+        f"You're an organizer responsible for only giving the skeleton (not the full content) for answering the question. "
+        f"Provide the skeleton in a list of points (numbered 1., 2., 3., etc.) to answer the question. Instead of writing a full sentence, "
+        f"each skeleton point should be very short with only 3~5 words. Generally, the skeleton should have 3~10 points.\n\n"
+        f"Question:\nWhat are the typical types of Chinese dishes?\nSkeleton:\n1. Dumplings. \n2. Noodles. \n3. Dim Sum. \n4. Hot Pot. \n5. Wonton. \n6. Ma Po Tofu. \n7. Char Siu. \n8. Fried Rice. \n\n"
+        f"Question:\nWhat are some practical tips for individuals to reduce their carbon emissions?\nSkeleton:\n1. Energy conservation. \n2. Efficient transportation. \n3. Home energy efficiency. \n4. Reduce water consumption. \n5. Sustainable diet. \n6. Sustainable travel. \n\n"
+        f"Now, please provide the skeleton for the following question.\n{prompt}\nSkeleton:\n"
+    )
+
+    outline_encoded = encode_tokens(tokenizer, outline_prompt, use_chat=True, starter=" 1.", bos=True, device=device)
+
+    # print("Outline prompt: ", tokenizer.DecodeIds(outline_encoded.tolist()[0]))
+
+    # print("outline shape", outline_encoded.shape)
+
+    outline_seq, (outline_decode_tokens, outline_decode_time) = generate(
+        model,
+        tokenizer,
+        outline_encoded,
+        max_seq_len,
+        draft_model=draft_model,
+        speculate_k=speculate_k,
+        interactive=interactive,
+        callback=callback,
+        temperature=temperature,
+        top_k=top_k,
+    )
+    return outline_decode_tokens, outline_decode_time
+
+# Breakdown the outline into individual points using regex (Second part)
+def break_down_outline(outline: str):
+    # Use regex to extract points
+    # Added \. to the end of the regex to ensure that the last point is also captured
+    # this is an improvement to SOT
+    re_result = re.findall(r"(\d+)\.\s?([\s\S]+?)(?=\.|\n|\n*$)", outline)
+    
+    if len(re_result) > 0:
+        points, point_outlines = zip(*re_result)
     else:
-        generated_tokens, _ = decode_n_tokens(model, next_token.view(batch_size, -1), input_pos, max_new_tokens - 1, callback=callback, **sampling_kwargs)
-        seq[:, T + 1:] = torch.cat(generated_tokens, dim=-1)
+        points, point_outlines = [], []
 
-    generate_stats = {
-        'accept_counts': accept_counts
-    }
-    return seq, generate_stats
+    # print("Points extracted: ", points)
+    # print("Point outlines extracted: ", point_outlines)
+    return points, point_outlines
 
-def encode_tokens(tokenizer, string, bos=True, device='cuda'):
+def generate_point_content(
+    tokenizer: SentencePieceProcessor,
+    model: Transformer, 
+    max_seq_len: int, 
+    device: str, 
+    draft_model: Transformer, 
+    speculate_k: int, 
+    interactive: bool, 
+    callback, 
+    temperature: float, 
+    top_k: int,
+    prompt: str,
+    outline: str,
+    point_outlines: List[str],
+) -> Tuple[torch.Tensor, int]:
+    # print("point_outlines: ", point_outlines)
+
+    # prepare prompts
+    all_point_prompts = []
+    all_point_starters = []
+    max_prompt_len = 0
+    for point_i, point_outline in enumerate(point_outlines):
+        point = str(point_i + 1)
+        point_outline = point_outline.strip() + "." if point_outline.strip()[-1] != '.' else ''
+        point_prompt = (
+            f"You're responsible for continuing the writing of one and only one point in the overall answer to the following question.\n\n"
+            f"{prompt}\n\nThe skeleton of the answer is\n\n{outline}\n\n"
+            f"Continue and only continue the writing of point {point}. Write it **very shortly** in 1~2 sentence and do not continue with other points!"
+        )
+
+        point_prompt_encoded = encode_tokens(tokenizer, point_prompt, use_chat=True, starter= f"{point}. {point_outline}", bos=True, device=device)
+
+        all_point_starters.append(encode_tokens(tokenizer, f"{point}. {point_outline.strip()}", device=device)[0])
+        all_point_prompts.append(point_prompt_encoded)
+
+        max_prompt_len = max(max_prompt_len, point_prompt_encoded.size(1))
+
+        # if point == "1":
+            # print(f"Point {point} prompt: ", tokenizer.DecodeIds(point_prompt_encoded.tolist()[0]))
+
+    # pad left 
+    for i in range(len(all_point_prompts)):
+        all_point_prompts[i] = F.pad(all_point_prompts[i], (max_prompt_len - all_point_prompts[i].size(1), 0), value=tokenizer.pad_id())
+
+    all_point_prompts = torch.cat(all_point_prompts, dim=0)
+
+    outline_seq, (content_tokens, point_decode_time) = generate(
+        model,
+        tokenizer,
+        all_point_prompts,
+        max_seq_len,
+        draft_model=draft_model,
+        speculate_k=speculate_k,
+        interactive=interactive,
+        callback=callback,
+        temperature=temperature,
+        top_k=top_k,
+    )
+
+    NEWLINE_TOKEN = torch.tensor(tokenizer.encode('\n'), dtype=torch.int, device=device).item()
+    # print('newline token', NEWLINE_TOKEN)
+    newline_tensor = torch.ones((content_tokens.size(0), 1), dtype=torch.int, device=device) * NEWLINE_TOKEN
+
+    print('content_tokens shape', content_tokens.shape)
+    print('newline_tensor shape', newline_tensor.shape)
+    print('starter shape', len(all_point_starters))
+
+    # print("all point starters: ")
+    # for i in range(len(all_point_starters)):
+        # print(f"starter {i+1}", tokenizer.DecodeIds(all_point_starters[i].tolist()))
+
+    points_tokens = []
+    # print("content tokens: ")
+    for i in range(len(all_point_starters)):
+        # print(f"content {i+1}", tokenizer.DecodeIds(content_tokens[i].tolist()))
+        # Extract content until <im_end>
+        if 256001 in content_tokens[i].tolist():
+            real_content = content_tokens[i][:content_tokens[i].tolist().index(256001)]
+        else:
+            real_content = content_tokens[i]
+
+        print(f"point {i} all point starters: ", all_point_starters[i].shape)
+        print(f"point {i} content tokens: ", real_content.shape)
+        print(f"point {i} newline tensor: ", newline_tensor[i].shape)
+        points_tokens.append(torch.cat([all_point_starters[i], real_content, newline_tensor[i]], dim=-1))
+
+    points_tokens = torch.cat(points_tokens, dim=0)
+    print("points shape", points_tokens.shape)
+    # print("points generated: ", tokenizer.DecodeIds(points_tokens.tolist()))
+
+    # remove the last newline token
+    points_tokens = points_tokens[:-1]
+
+    return points_tokens.reshape(1, -1), point_decode_time
+
+def sot_generate(
+    model: Transformer,
+    tokenizer: SentencePieceProcessor,
+    prompt: str,
+    max_seq_len: int,
+    *,
+    interactive: bool,
+    draft_model: Transformer,
+    speculate_k: Optional[int] = 8,
+    callback = lambda x: x,
+    device='cuda',
+    **sampling_kwargs
+) -> torch.Tensor:
+    torch.manual_seed(42)
+    
+    temperature = sampling_kwargs["temperature"]
+    top_k = sampling_kwargs["top_k"]
+
+    prompt = preprocess_prompt(prompt)
+    
+    t0 = time.time()
+
+    # Step 1: Generate outline
+    outline_tokens, outline_decode_time = generate_outline(
+        tokenizer,
+        model,
+        max_seq_len,
+        device,
+        draft_model,
+        speculate_k,
+        interactive,
+        callback,
+        temperature,
+        top_k,
+        prompt,
+    )
+    outline = "1." + tokenizer.DecodeIds(outline_tokens.tolist()[0])
+    
+    print("Outline time: ", outline_decode_time)
+    print("Outline generated: ", outline)
+
+    # Step 2: Break down outline into points
+    points, point_outlines = break_down_outline(outline)
+
+    print("Got a total of", len(points), "points")
+    
+    # Improvement from SOT: dedup by point outline not point indices
+    # Deduplicate points
+    point_outlines_filtered = []
+    points_set = set([])
+    for i in range(len(points)):
+        # Get unique point outline
+        if point_outlines[i] not in points_set:
+            points_set.add(point_outlines[i])
+            point_outlines_filtered.append(point_outlines[i])
+
+    point_outlines = point_outlines_filtered
+    print("After deduplication, got a total of", len(point_outlines), "points")
+
+    # cap at max batch size
+    if len(point_outlines) > MAX_BATCH_SIZE:
+        print("Capping at max batch size")
+    point_outlines = point_outlines[:MAX_BATCH_SIZE]
+
+    # recontruct outline
+    outline = "\n".join([f"{point+1}. {point_outline}" for point, point_outline in enumerate(point_outlines)])
+
+    print("Reconstructed outline: ", outline)
+
+    # Step 3: Generate content for each point in a batch
+    points_tokens, points_decode_time = generate_point_content(
+        tokenizer,
+        model,
+        max_seq_len,
+        device,
+        draft_model,
+        speculate_k,
+        interactive,
+        callback,
+        temperature,
+        top_k,
+        prompt,
+        outline,
+        point_outlines,
+    )
+    
+    t1 = time.time()
+
+
+    # Format in the expected way
+    prompt_tokens = encode_tokens(tokenizer, prompt, use_chat=True, bos=True, device=device)
+    print("prompt_tokens shape", prompt_tokens.shape)
+    print("points_tokens shape", points_tokens.shape)
+    print("prompt tokens", prompt_tokens)
+    print("point tokens", points_tokens)
+    seq = torch.cat([prompt_tokens, points_tokens], dim=-1)
+    print("seq", seq)
+    print("seq text", tokenizer.DecodeIds(seq.tolist()[0]))
+
+    return seq, (points_tokens, outline_tokens, points_decode_time, outline_decode_time, t1 - t0)
+
+
+def encode_tokens(tokenizer, string, starter=None, use_chat=False, bos=True, device='cuda'):
+    if use_chat:
+        # Hardcode it bc we will only have a single user prompt message
+        system_prompt = "You are a helpful AI assistant"
+        string = f"<|im_start|>system\n{system_prompt}<|im_end|>\n<|im_start|>user\n{string}<|im_end|>\n<|im_start|>assistant\n"
+        if starter:
+            string += starter
+
     tokens = tokenizer.encode(string)
     if bos:
         tokens = [tokenizer.bos_id()] + tokens
-    return torch.tensor(tokens, dtype=torch.int, device=device)
+    return torch.tensor([tokens], dtype=torch.int, device=device)
 
-def _load_model(checkpoint_path, device, precision, use_tp):
+
+def _load_model(checkpoint_path, device, precision, use_tp, resize_embedding=None, model_name=None):
     with torch.device('meta'):
-        model = Transformer.from_name(checkpoint_path.parent.name)
+        model_name = model_name or checkpoint_path.parent.name
+        model = Transformer.from_name(model_name)
 
-    if "int8" in str(checkpoint_path):
-        print("Using int8 weight-only quantization!")
-        from quantize import WeightOnlyInt8QuantHandler
-        simple_quantizer = WeightOnlyInt8QuantHandler(model)
-        model = simple_quantizer.convert_for_runtime()
+    # if "int8" in str(checkpoint_path):
+    #     print("Using int8 weight-only quantization!")
+    #     from quantize import WeightOnlyInt8QuantHandler
+    #     simple_quantizer = WeightOnlyInt8QuantHandler(model)
+    #     model = simple_quantizer.convert_for_runtime()
 
-    if "int4" in str(checkpoint_path):
-        print("Using int4 quantization!")
-        path_comps = checkpoint_path.name.split(".")
-        assert path_comps[-2].startswith("g")
-        groupsize = int(path_comps[-2][1:])
-        from quantize import WeightOnlyInt4QuantHandler
-        simple_quantizer = WeightOnlyInt4QuantHandler(model, groupsize)
-        model = simple_quantizer.convert_for_runtime()
+    # if "int4" in str(checkpoint_path):
+    #     print("Using int4 quantization!")
+    #     path_comps = checkpoint_path.name.split(".")
+    #     assert path_comps[-2].startswith("g")
+    #     groupsize = int(path_comps[-2][1:])
+    #     from quantize import WeightOnlyInt4QuantHandler
+    #     simple_quantizer = WeightOnlyInt4QuantHandler(model, groupsize)
+    #     model = simple_quantizer.convert_for_runtime()
 
-    checkpoint = torch.load(str(checkpoint_path), mmap=True, weights_only=True)
+    checkpoint = torch.load(str(checkpoint_path), weights_only=True)
     model.load_state_dict(checkpoint, assign=True)
 
-    if use_tp:
-        from tp import apply_tp
-        print("Applying tensor parallel to model ...")
-        apply_tp(model)
+    if resize_embedding is not None:
+        print(f"Resizing embedding dimension to {resize_embedding} ...")
+        old_tok_embedding_weight = model.tok_embeddings.weight
+        _, embed_dim = old_tok_embedding_weight.shape
+        model.tok_embeddings = torch.nn.Embedding(resize_embedding, embed_dim)
+        model.tok_embeddings.weight.data[:old_tok_embedding_weight.size(0)] = old_tok_embedding_weight
+
+    # if use_tp:
+    #     from tp import apply_tp
+    #     print("Applying tensor parallel to model ...")
+    #     apply_tp(model)
 
     model = model.to(device=device, dtype=precision)
     return model.eval()
@@ -304,7 +619,6 @@ def main_fn(
     interactive: bool = False,
     num_samples: int = 5,
     max_seq_len: int = 100,
-    batch_size: int = 1,
     top_k: int = 200,
     temperature: float = 0.8,
     checkpoint_path: Optional[str] = None,
@@ -318,6 +632,7 @@ def main_fn(
     resize_embedding=None,
     model_name=None,
     output_file=None,
+    sot=False,
 ) -> None:
     global _debug_tokenizer
     """Generates text samples based on a pre-trained Transformer model and tokenizer.
@@ -380,6 +695,14 @@ def main_fn(
 
     tokenizer = SentencePieceProcessor()
     tokenizer.LoadFromSerializedProto(m.SerializeToString())
+    special_tokens = ["<|im_start|>", "<|im_end|>"]
+
+    for token in special_tokens:
+        new_token = m.SentencePiece()
+        new_token.piece = token
+        new_token.score = 0
+        new_token.type = 4 # type value for USER_DEFINED
+        m.pieces.append(new_token)
 
     print("Vocab size:", len(m.pieces))
 
@@ -461,34 +784,35 @@ def main_fn(
             'tokens_per_sec': [],
             'accept_counts': [],
         }
-        start = -1 if compile else 0
+        start = -1 if _compile else 0
 
         torch.manual_seed(1234)
         for i in range(start, num_samples):
+            print(f"Sample {i + 1} of {num_samples}")
             device_sync(device=device) # MKG
-            if i >= 0 and interactive:
-                prompt = input("What is your prompt? ")
-                if is_chat:
-                    prompt = f"{B_INST} {prompt.strip()} {E_INST}"
-                encoded = encode_tokens(tokenizer, prompt, bos=True, device=device)
+            # if i >= 0 and interactive:
+            #     prompt = input("What is your prompt? ")
+            #     if is_chat:
+            #         prompt = f"{B_INST} {prompt.strip()} {E_INST}"
+            #     encoded = encode_tokens(tokenizer, prompt, bos=True, device=device)
 
-            if interactive and i >= 0:
-                buffer = []
-                period_id = tokenizer.EncodeAsIds('.')[0]
-                done_generating = False
-                def callback(x):
-                    nonlocal done_generating
-                    if done_generating:
-                        return
-                    buffer.append(tokenizer.DecodeIds([period_id] + x.tolist())[1:])
-                    if x.item() == tokenizer.eos_id():
-                        done_generating = True
-                    if len(buffer) == 4 or done_generating:
-                        print(''.join(buffer), end='', flush=True)
-                        buffer.clear()
-                    # print(, end='', flush=True)
-            else:
-                callback = lambda x : x
+            # if interactive and i >= 0:
+            #     buffer = []
+            #     period_id = tokenizer.EncodeAsIds('.')[0]
+            #     done_generating = False
+            #     def callback(x):
+            #         nonlocal done_generating
+            #         if done_generating:
+            #             return
+            #         buffer.append(tokenizer.DecodeIds([period_id] + x.tolist())[1:])
+            #         if x.item() == tokenizer.eos_id():
+            #             done_generating = True
+            #         if len(buffer) == 4 or done_generating:
+            #             print(''.join(buffer), end='', flush=True)
+            #             buffer.clear()
+            #         # print(, end='', flush=True)
+            # else:
+            callback = lambda x : x
             t0 = time.perf_counter()
             import contextlib
             if (i != num_samples - 1 or not profile) or (use_tp and rank != 0):
@@ -497,20 +821,46 @@ def main_fn(
                 print("*****Profiling*****")
                 torch.profiler._utils._init_for_cuda_graphs()
                 prof = torch.profiler.profile()
+
+            print("Generating...")
             
             with prof as p:
-                y, (decode_tokens, decode_time) = generate(
-                    model,
-                    encoded,
-                    max_seq_len,
-                    batch_size=batch_size,
-                    draft_model=draft_model,
-                    speculate_k=speculate_k,
-                    interactive=interactive,
-                    callback=callback,
-                    temperature=temperature,
-                    top_k=top_k,
-                )
+                if sot:
+                    y, (point_tokens, 
+                        outline_tokens, 
+                        points_decode_time,
+                        outline_decode_time,
+                        total_time
+                    ) = sot_generate(
+                        model,
+                        tokenizer,
+                        prompt,
+                        max_seq_len,
+                        draft_model=draft_model,
+                        speculate_k=speculate_k,
+                        interactive=interactive,
+                        callback=callback,
+                        temperature=temperature,
+                        top_k=top_k,
+                        device=device,
+                    )
+                    decode_time = points_decode_time + outline_decode_time
+                    tokens_generated = point_tokens.size(-1)
+                else:
+                    # Just do regular generation
+                    y, (decode_tokens, decode_time) = generate(
+                        model,
+                        tokenizer,
+                        encoded,
+                        max_seq_len,
+                        draft_model=draft_model,
+                        speculate_k=speculate_k,
+                        interactive=interactive,
+                        callback=callback,
+                        temperature=temperature,
+                        top_k=top_k,
+                    )
+                    tokens_generated = decode_tokens.size(-1)
             if (i != num_samples - 1 or not profile) or (use_tp and rank != 0):
                 pass
             else:
@@ -529,9 +879,11 @@ def main_fn(
                     prof.export_chrome_trace(f"{profile}.json")
             device_sync(device=device) # MKG
             t = time.perf_counter() - t0
-            print(tokenizer.DecodeIds(y.tolist()))
+            # print('ylist shape', f"({len(y.tolist())}, {len(y.tolist()[0])})")
+
+            output = tokenizer.DecodeIds(y.tolist()[0])
+            print(output)
             
-            tokens_generated = len(decode_tokens)
             tokens_sec = tokens_generated / decode_time
             aggregate_metrics['tokens_per_sec'].append(tokens_sec)
             print(f"Tokens generated: {tokens_generated}, time taken: {t:.02f} sec")
@@ -551,11 +903,17 @@ def main_fn(
             "name": name,
             "tokens_per_sec": aggregate_metrics['tokens_per_sec'],
             "decode_time": decode_time,
-            "output": tokenizer.DecodeIds(y.tolist()),
+            "output": output,
 # CHECK-BEGIN
 #             "inconsistency_with_reference": ctx.inconsistency_with_reference,
 # CHECK-END
         }
+        if sot:
+            json_result.update({
+                "outline_time": outline_decode_time,
+                "points_time": points_decode_time,
+                "total_time": total_time,
+            })
         log_file.write(json.dumps(json_result) + "\n")
         print(f"JSON: {json.dumps(json_result)}")
 
@@ -567,7 +925,6 @@ def main(argv):
             FLAGS.interactive,
             FLAGS.num_samples,
             FLAGS.max_seq_len,
-            FLAGS.batch_size,
             FLAGS.top_k,
             FLAGS.temperature,
             FLAGS.checkpoint_path,
@@ -581,6 +938,7 @@ def main(argv):
             FLAGS.resize_embedding,
             FLAGS.model_name,
             FLAGS.output_file,
+            FLAGS.sot,
         )
 
 if __name__ == '__main__':
