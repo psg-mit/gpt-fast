@@ -218,12 +218,12 @@ def generate(
     # create an empty tensor of the expected final shape and fill in the current tokens
     T = prompt.size(-1)
     num_prompt_tokens = T
-    # batch_size = prompt.size(0)
-    batch_size = MAX_BATCH_SIZE
+    batch_size = prompt.size(0)
+    # batch_size = MAX_BATCH_SIZE
 
     # pad to batch size
-    if prompt.size(0) < batch_size:
-        prompt = F.pad(prompt.clone(), (0, 0, 0, batch_size - prompt.size(0)), value=tokenizer.pad_id())
+    # if prompt.size(0) < batch_size:
+    #     prompt = F.pad(prompt.clone(), (0, 0, 0, batch_size - prompt.size(0)), value=tokenizer.pad_id())
     
     # T_new = T + max_new_tokens
     # if interactive:
