@@ -64,7 +64,7 @@ flags.DEFINE_string("output_file", None, "output file")
 flags.DEFINE_string("positional_encoding_mode", "const-40", "positional encoding mode")
 flags.DEFINE_boolean("sot", False, "Whether to use sot")
 
-MAX_BATCH_SIZE = 8
+MAX_BATCH_SIZE = 32
 
 def device_sync(device):
     if "cuda" in device:
@@ -227,12 +227,12 @@ def generate(
     # create an empty tensor of the expected final shape and fill in the current tokens
     T = prompt.size(-1)
     num_prompt_tokens = T
-    batch_size = prompt.size(0)
-    # batch_size = MAX_BATCH_SIZE
+    # batch_size = prompt.size(0)
+    batch_size = MAX_BATCH_SIZE
 
     # pad to batch size
-    # if prompt.size(0) < batch_size:
-    #     prompt = F.pad(prompt.clone(), (0, 0, 0, batch_size - prompt.size(0)), value=tokenizer.pad_id())
+    if prompt.size(0) < batch_size:
+        prompt = F.pad(prompt.clone(), (0, 0, 0, batch_size - prompt.size(0)), value=256001)
     
     # T_new = T + max_new_tokens
     # if interactive:
