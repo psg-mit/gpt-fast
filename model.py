@@ -100,8 +100,10 @@ class Transformer(nn.Module):
         self.max_seq_length = -1
 
     def setup_caches(self, max_batch_size, max_seq_length):
-        if self.max_seq_length >= max_seq_length and self.max_batch_size >= max_batch_size:
+        if self.max_seq_length == max_seq_length and self.max_batch_size == max_batch_size:
             return
+        # if self.max_seq_length >= max_seq_length and self.max_batch_size >= max_batch_size:
+        #     return
         max_seq_length = find_multiple(max_seq_length, 8)
         self.max_seq_length = max_seq_length
         self.max_batch_size = max_batch_size
