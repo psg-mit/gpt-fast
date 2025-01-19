@@ -64,7 +64,7 @@ flags.DEFINE_string("output_file", None, "output file")
 flags.DEFINE_string("positional_encoding_mode", "const-40", "positional encoding mode")
 flags.DEFINE_boolean("sot", False, "Whether to use sot")
 
-MAX_BATCH_SIZE = 32
+MAX_BATCH_SIZE = 8
 
 def device_sync(device):
     if "cuda" in device:
@@ -121,20 +121,28 @@ def decode_one_token(model: Transformer, x: torch.Tensor, input_pos: torch.Tenso
     logits = model(x, input_pos)
     return sample(logits, **sampling_kwargs)
 
-def decode_n_tokens(model: Transformer, cur_token: torch.Tensor, input_pos: torch.Tensor, num_new_tokens: int, callback=lambda _: _, **sampling_kwargs):
+def decode_n_tokens(model: Transformer, cur_token: torch.Tensor, input_pos: torch.Tensor, num_new_tokens: int, callback=lambda _: _, print_tokens=False, **sampling_kwargs):
     new_tokens = [cur_token.clone()]
     is_done = [False] * cur_token.size(0)
+
     for i in range(num_new_tokens):
         with torch.backends.cuda.sdp_kernel(enable_flash=False, enable_mem_efficient=False, enable_math=True): # Actually better for Inductor to codegen attention here
             is_done = [a or b[0] == 256001 for a, b in zip(is_done, cur_token.clone().tolist())]
+            if print_tokens:
+                print("iteration:", i)
+                print("starting tokens:", cur_token.clone().tolist())
+                print("is_done:", is_done)
             # If all examples in batch reached EOS, break
             if all(is_done):
+                # print("All examples reached EOS")
                 break
 
             next_token, next_prob = decode_one_token(
                 model, cur_token, input_pos, **sampling_kwargs
             )
             input_pos += 1
+            # if cur token is 256001, then set next token to 256001
+            next_token = torch.where(cur_token == 256001, torch.tensor(256001, device=cur_token.device, dtype=torch.int), next_token)
             new_tokens.append(next_token.clone())
             callback(new_tokens[-1])
             # new_probs.append(next_prob.clone())
@@ -208,6 +216,7 @@ def generate(
     draft_model: Transformer,
     speculate_k: Optional[int] = 8,
     callback = lambda x: x,
+    print_tokens=False,
     **sampling_kwargs
 ) -> torch.Tensor:
     """
@@ -223,7 +232,9 @@ def generate(
 
     # pad to batch size
     if prompt.size(0) < batch_size:
-        prompt = F.pad(prompt.clone(), (0, 0, 0, batch_size - prompt.size(0)), value=tokenizer.pad_id())
+        prompt = F.pad(prompt.clone(), (0, 0, 0, batch_size - prompt.size(0)), value=256001)
+
+        # print(prompt)
     
     # T_new = T + max_new_tokens
     # if interactive:
@@ -252,7 +263,10 @@ def generate(
     # print("cache batch size", model.max_batch_size)
     # print("cache seq length", model.max_seq_length)
 
-    next_token = prefill(model, prompt.view(batch_size, -1), input_pos, **sampling_kwargs).clone()
+    next_token = prefill(model, prompt, input_pos, **sampling_kwargs).clone()
+    # set to 256001 if the final prompt token is 256001
+    prompt_last_tokens = prompt[:, -2:-1]
+    next_token = torch.where(prompt_last_tokens == 256001, torch.tensor(256001, device=device, dtype=torch.int), next_token)
     # print("Initial next_ids", next_token)
     # if is_speculative:
     #     prefill(draft_model, prompt.view(batch_size, -1), input_pos, **sampling_kwargs)
@@ -282,7 +296,7 @@ def generate(
 
     max_new_tokens = max_seq_len - num_prompt_tokens - 1
     time0 = time.time()
-    generated_ids = decode_n_tokens(model, next_token.view(batch_size, -1), input_pos, max_new_tokens - 1, callback=callback, **sampling_kwargs)
+    generated_ids = decode_n_tokens(model, next_token.view(batch_size, -1), input_pos, max_new_tokens - 1, callback=callback, print_tokens=print_tokens, **sampling_kwargs)
     time1 = time.time()
 
     # print('prompt', prompt)
@@ -324,12 +338,13 @@ def generate_outline(
         f"each skeleton point should be very short with only 3~5 words. Generally, the skeleton should have 3~10 points.\n\n"
         f"Question:\nWhat are the typical types of Chinese dishes?\nSkeleton:\n1. Dumplings. \n2. Noodles. \n3. Dim Sum. \n4. Hot Pot. \n5. Wonton. \n6. Ma Po Tofu. \n7. Char Siu. \n8. Fried Rice. \n\n"
         f"Question:\nWhat are some practical tips for individuals to reduce their carbon emissions?\nSkeleton:\n1. Energy conservation. \n2. Efficient transportation. \n3. Home energy efficiency. \n4. Reduce water consumption. \n5. Sustainable diet. \n6. Sustainable travel. \n\n"
-        f"Now, please provide the skeleton for the following question.\n{prompt}\nSkeleton:\n"
+        f"Now, please provide the skeleton for the following question.\n{prompt}\n\nSkeleton:\n"
     )
 
-    outline_encoded = encode_tokens(tokenizer, outline_prompt, use_chat=True, starter=" 1.", bos=True, device=device)
+    # outline_encoded = encode_tokens(tokenizer, outline_prompt, use_chat=True, bos=True, device=device)
+    outline_encoded = encode_tokens(tokenizer, outline_prompt, use_chat=True, starter="1.", bos=True, device=device)
 
-    # print("Outline prompt: ", tokenizer.DecodeIds(outline_encoded.tolist()[0]))
+    print("Outline prompt: ", tokenizer.DecodeIds(outline_encoded.tolist()[0]))
 
     # print("outline shape", outline_encoded.shape)
 
@@ -344,6 +359,7 @@ def generate_outline(
         callback=callback,
         temperature=temperature,
         top_k=top_k,
+        # print_tokens=True,
     )
     return outline_decode_tokens, outline_decode_time
 
@@ -386,22 +402,27 @@ def generate_point_content(
     max_prompt_len = 0
     for point_i, point_outline in enumerate(point_outlines):
         point = str(point_i + 1)
-        point_outline = point_outline.strip() + "." if point_outline.strip()[-1] != '.' else ''
+        point_outline = point_outline.strip()
+        if point_outline[-1] == ".":
+            point_outline = point_outline[:-1]
+
         point_prompt = (
             f"You're responsible for continuing the writing of one and only one point in the overall answer to the following question.\n\n"
             f"{prompt}\n\nThe skeleton of the answer is\n\n{outline}\n\n"
             f"Continue and only continue the writing of point {point}. Write it **very shortly** in 1~2 sentence and do not continue with other points!"
         )
 
-        point_prompt_encoded = encode_tokens(tokenizer, point_prompt, use_chat=True, starter= f"{point}. {point_outline}", bos=True, device=device)
+        # point_prompt_encoded = encode_tokens(tokenizer, point_prompt, use_chat=True, bos=True, device=device)
+        starter = f"{point}. {point_outline}: "
+        point_prompt_encoded = encode_tokens(tokenizer, point_prompt, use_chat=True, starter= starter, bos=True, device=device)
 
-        all_point_starters.append(encode_tokens(tokenizer, f"{point}. {point_outline.strip()}", device=device)[0])
+        all_point_starters.append(encode_tokens(tokenizer, starter, device=device)[0])
         all_point_prompts.append(point_prompt_encoded)
 
         max_prompt_len = max(max_prompt_len, point_prompt_encoded.size(1))
 
-        # if point == "1":
-            # print(f"Point {point} prompt: ", tokenizer.DecodeIds(point_prompt_encoded.tolist()[0]))
+        if point == "1":
+            print(f"Point {point} prompt: ", tokenizer.DecodeIds(point_prompt_encoded.tolist()[0]))
 
     # pad left 
     for i in range(len(all_point_prompts)):
@@ -409,7 +430,7 @@ def generate_point_content(
 
     all_point_prompts = torch.cat(all_point_prompts, dim=0)
 
-    outline_seq, (content_tokens, point_decode_time) = generate(
+    content_seq, (content_tokens, point_decode_time) = generate(
         model,
         tokenizer,
         all_point_prompts,
@@ -420,6 +441,7 @@ def generate_point_content(
         callback=callback,
         temperature=temperature,
         top_k=top_k,
+        # print_tokens=True,
     )
 
     NEWLINE_TOKEN = torch.tensor(tokenizer.encode('\n'), dtype=torch.int, device=device).item()
@@ -435,9 +457,12 @@ def generate_point_content(
         # print(f"starter {i+1}", tokenizer.DecodeIds(all_point_starters[i].tolist()))
 
     points_tokens = []
+    point_strs = []
     # print("content tokens: ")
     for i in range(len(all_point_starters)):
-        # print(f"content {i+1}", tokenizer.DecodeIds(content_tokens[i].tolist()))
+        # replace 256001 with eos token
+        tokens_list = [x if x != 1 else 256001 for x in content_tokens[i].tolist()]
+        print(f"point {i+1} content:", tokenizer.DecodeIds(tokens_list))
         # Extract content until <im_end>
         if 256001 in content_tokens[i].tolist():
             real_content = content_tokens[i][:content_tokens[i].tolist().index(256001)]
@@ -447,16 +472,23 @@ def generate_point_content(
         print(f"point {i} all point starters: ", all_point_starters[i].shape)
         print(f"point {i} content tokens: ", real_content.shape)
         print(f"point {i} newline tensor: ", newline_tensor[i].shape)
-        points_tokens.append(torch.cat([all_point_starters[i], real_content, newline_tensor[i]], dim=-1))
+        cur_point_tokens = torch.cat([all_point_starters[i], real_content, newline_tensor[i]], dim=-1)
+        points_tokens.append(cur_point_tokens)
 
+        cur_point_tokens_list:list = cur_point_tokens.tolist()
+        if 256001 in cur_point_tokens_list:
+            cur_point_tokens_list = cur_point_tokens_list[:cur_point_tokens_list.index(256001) + 1]
+        point_strs.append(tokenizer.DecodeIds(cur_point_tokens_list))
+
+    
     points_tokens = torch.cat(points_tokens, dim=0)
     print("points shape", points_tokens.shape)
     # print("points generated: ", tokenizer.DecodeIds(points_tokens.tolist()))
 
-    # remove the last newline token
-    points_tokens = points_tokens[:-1]
+    # replace the last newline token with eos token
+    points_tokens[-1] = 256001
 
-    return points_tokens.reshape(1, -1), point_decode_time
+    return points_tokens.reshape(1, -1), point_decode_time, point_strs
 
 def sot_generate(
     model: Transformer,
@@ -494,7 +526,16 @@ def sot_generate(
         top_k,
         prompt,
     )
-    og_outline = "1." + tokenizer.DecodeIds(outline_tokens.tolist()[0])
+    # truncate outline tokens to 256001
+    outline_tokens_list:list = outline_tokens.tolist()[0]
+    if 256001 in outline_tokens_list:
+        outline_tokens_list = outline_tokens_list[:outline_tokens_list.index(256001)+1]
+        og_outline = "1." + tokenizer.DecodeIds(outline_tokens_list[:-1])
+        og_outline_str = "1." + tokenizer.DecodeIds(outline_tokens_list)
+    else:
+        og_outline = "1." + tokenizer.DecodeIds(outline_tokens_list)
+        og_outline_str = "1." + tokenizer.DecodeIds(outline_tokens_list)
+    # og_outline = tokenizer.DecodeIds(outline_tokens.tolist()[0])
     
     print("Outline time: ", outline_decode_time)
     print("Outline generated: ", og_outline)
@@ -528,7 +569,7 @@ def sot_generate(
     print("Reconstructed outline: ", outline)
 
     # Step 3: Generate content for each point in a batch
-    points_tokens, points_decode_time = generate_point_content(
+    points_tokens, points_decode_time, point_strs = generate_point_content(
         tokenizer,
         model,
         max_seq_len,
@@ -557,7 +598,7 @@ def sot_generate(
     print("seq", seq)
     print("seq text", tokenizer.DecodeIds(seq.tolist()[0]))
 
-    return seq, (points_tokens, outline_tokens, points_decode_time, outline_decode_time, og_outline, t1 - t0)
+    return seq, (points_tokens, outline_tokens, points_decode_time, outline_decode_time, og_outline_str, point_strs, t1 - t0)
 
 
 def encode_tokens(tokenizer, string, starter=None, use_chat=False, bos=True, device='cuda'):
@@ -831,6 +872,7 @@ def main_fn(
                         points_decode_time,
                         outline_decode_time,
                         og_outline,
+                        point_strs,
                         total_time
                     ) = sot_generate(
                         model,
@@ -915,6 +957,7 @@ def main_fn(
                 "points_time": points_decode_time,
                 "total_time": total_time,
                 "outline": og_outline,
+                "point_strs": point_strs,
             })
         log_file.write(json.dumps(json_result) + "\n")
         print(f"JSON: {json.dumps(json_result)}")
