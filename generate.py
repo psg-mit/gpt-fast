@@ -494,13 +494,13 @@ def sot_generate(
         top_k,
         prompt,
     )
-    outline = "1." + tokenizer.DecodeIds(outline_tokens.tolist()[0])
+    og_outline = "1." + tokenizer.DecodeIds(outline_tokens.tolist()[0])
     
     print("Outline time: ", outline_decode_time)
-    print("Outline generated: ", outline)
+    print("Outline generated: ", og_outline)
 
     # Step 2: Break down outline into points
-    points, point_outlines = break_down_outline(outline)
+    points, point_outlines = break_down_outline(og_outline)
 
     print("Got a total of", len(points), "points")
     
@@ -557,7 +557,7 @@ def sot_generate(
     print("seq", seq)
     print("seq text", tokenizer.DecodeIds(seq.tolist()[0]))
 
-    return seq, (points_tokens, outline_tokens, points_decode_time, outline_decode_time, t1 - t0)
+    return seq, (points_tokens, outline_tokens, points_decode_time, outline_decode_time, og_outline, t1 - t0)
 
 
 def encode_tokens(tokenizer, string, starter=None, use_chat=False, bos=True, device='cuda'):
@@ -830,6 +830,7 @@ def main_fn(
                         outline_tokens, 
                         points_decode_time,
                         outline_decode_time,
+                        og_outline,
                         total_time
                     ) = sot_generate(
                         model,
@@ -913,6 +914,7 @@ def main_fn(
                 "outline_time": outline_decode_time,
                 "points_time": points_decode_time,
                 "total_time": total_time,
+                "outline": og_outline,
             })
         log_file.write(json.dumps(json_result) + "\n")
         print(f"JSON: {json.dumps(json_result)}")
