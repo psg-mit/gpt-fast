@@ -401,8 +401,8 @@ def generate_point_content(
     for point_i, point_outline in enumerate(point_outlines):
         point = str(point_i + 1)
         point_outline = point_outline.strip()
-        if point_outline[-1] == ".":
-            point_outline = point_outline[:-1]
+        # if point_outline[-1] == ".":
+        #     point_outline = point_outline[:-1]
 
         point_prompt = (
             f"You're responsible for continuing the writing of one and only one point in the overall answer to the following question.\n\n"
@@ -411,7 +411,7 @@ def generate_point_content(
         )
 
         # point_prompt_encoded = encode_tokens(tokenizer, point_prompt, use_chat=True, bos=True, device=device)
-        starter = f"{point}. {point_outline}: "
+        starter = f"{point}. {point_outline}"
         point_prompt_encoded = encode_tokens(tokenizer, point_prompt, use_chat=True, starter= starter, bos=True, device=device)
 
         all_point_starters.append(encode_tokens(tokenizer, starter, device=device)[0])
