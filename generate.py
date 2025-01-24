@@ -27,6 +27,7 @@ import warnings
 from sentencepiece import sentencepiece_model_pb2
 from sentencepiece import SentencePieceProcessor
 from model import Transformer
+
 # LOCAL-END
 
 # GOOGLE-BEGIN
@@ -52,7 +53,9 @@ flags.DEFINE_integer("top_k", 200, "Top-k for sampling.")
 flags.DEFINE_float("temperature", 0.0, "Temperature for sampling.")
 flags.DEFINE_string("checkpoint_path", None, "Model checkpoint path.")
 flags.DEFINE_boolean("compile", True, "Whether to compile the model.")
-flags.DEFINE_boolean("compile_prefill", False, "Whether to compile the prefill (improves prefill perf, but higher compile times)")
+flags.DEFINE_boolean(
+    "compile_prefill", False, "Whether to compile the prefill (improves prefill perf, but higher compile times)"
+)
 flags.DEFINE_string("profile", None, "Profile path.")
 flags.DEFINE_integer("speculate_k", 5, "Speculative execution depth.")
 flags.DEFINE_string("draft_checkpoint_path", None, "Draft checkpoint path.")
@@ -66,6 +69,7 @@ flags.DEFINE_boolean("sot", False, "Whether to use sot")
 
 MAX_BATCH_SIZE = 8
 
+
 def device_sync(device):
     if "cuda" in device:
         torch.cuda.synchronize()
@@ -78,7 +82,7 @@ def device_sync(device):
 torch._inductor.config.coordinate_descent_tuning = True
 torch._inductor.config.triton.unique_kernel_names = True
 # Experimental features to reduce compilation times, will be on by default in future
-torch._inductor.config.fx_graph_cache = True 
+torch._inductor.config.fx_graph_cache = True
 torch._functorch.config.enable_autograd_cache = True
 
 
@@ -91,9 +95,10 @@ from sentencepiece import SentencePieceProcessor
 from model import Transformer
 
 
-def multinomial_sample_one_no_sync(probs_sort): # Does multinomial sampling without a cuda synchronization
+def multinomial_sample_one_no_sync(probs_sort):  # Does multinomial sampling without a cuda synchronization
     q = torch.empty_like(probs_sort).exponential_(1)
     return torch.argmax(probs_sort / q, dim=-1, keepdim=True).to(dtype=torch.int)
+
 
 def logits_to_probs(logits, temperature: float = 1.0, top_k: Optional[int] = None):
     logits = logits / max(temperature, 1e-5)
@@ -105,28 +110,44 @@ def logits_to_probs(logits, temperature: float = 1.0, top_k: Optional[int] = Non
     probs = torch.nn.functional.softmax(logits, dim=-1)
     return probs
 
+
 def sample(logits, temperature: float = 1.0, top_k: Optional[int] = None):
     probs = logits_to_probs(logits[:, -1], temperature, top_k)
     idx_next = multinomial_sample_one_no_sync(probs)
     return idx_next, probs
+
 
 def prefill(model: Transformer, x: torch.Tensor, input_pos: torch.Tensor, **sampling_kwargs) -> torch.Tensor:
     # input_pos: [B, S]
     logits = model(x, input_pos)
     return sample(logits, **sampling_kwargs)[0]
 
-def decode_one_token(model: Transformer, x: torch.Tensor, input_pos: torch.Tensor, **sampling_kwargs) -> Tuple[torch.Tensor, torch.Tensor]:
+
+def decode_one_token(
+    model: Transformer, x: torch.Tensor, input_pos: torch.Tensor, **sampling_kwargs
+) -> Tuple[torch.Tensor, torch.Tensor]:
     # input_pos: [B, 1]
     # assert input_pos.shape[-1] == 1
     logits = model(x, input_pos)
     return sample(logits, **sampling_kwargs)
 
-def decode_n_tokens(model: Transformer, cur_token: torch.Tensor, input_pos: torch.Tensor, num_new_tokens: int, callback=lambda _: _, print_tokens=False, **sampling_kwargs):
+
+def decode_n_tokens(
+    model: Transformer,
+    cur_token: torch.Tensor,
+    input_pos: torch.Tensor,
+    num_new_tokens: int,
+    callback=lambda _: _,
+    print_tokens=False,
+    **sampling_kwargs,
+):
     new_tokens = [cur_token.clone()]
     is_done = [False] * cur_token.size(0)
 
     for i in range(num_new_tokens):
-        with torch.backends.cuda.sdp_kernel(enable_flash=False, enable_mem_efficient=False, enable_math=True): # Actually better for Inductor to codegen attention here
+        with torch.backends.cuda.sdp_kernel(
+            enable_flash=False, enable_mem_efficient=False, enable_math=True
+        ):  # Actually better for Inductor to codegen attention here
             is_done = [a or b[0] == 256001 for a, b in zip(is_done, cur_token.clone().tolist())]
             if print_tokens:
                 print("iteration:", i)
@@ -137,16 +158,16 @@ def decode_n_tokens(model: Transformer, cur_token: torch.Tensor, input_pos: torc
                 # print("All examples reached EOS")
                 break
 
-            next_token, next_prob = decode_one_token(
-                model, cur_token, input_pos, **sampling_kwargs
-            )
+            next_token, next_prob = decode_one_token(model, cur_token, input_pos, **sampling_kwargs)
             input_pos += 1
             # if cur token is 256001, then set next token to 256001
-            next_token = torch.where(cur_token == 256001, torch.tensor(256001, device=cur_token.device, dtype=torch.int), next_token)
+            next_token = torch.where(
+                cur_token == 256001, torch.tensor(256001, device=cur_token.device, dtype=torch.int), next_token
+            )
             new_tokens.append(next_token.clone())
             callback(new_tokens[-1])
             # new_probs.append(next_prob.clone())
-            
+
             cur_token = next_token.clone()
 
     return new_tokens
@@ -155,25 +176,28 @@ def decode_n_tokens(model: Transformer, cur_token: torch.Tensor, input_pos: torc
 def model_forward(model, x, input_pos):
     return model(x, input_pos)
 
+
 def speculative_decode(
     model: Transformer,
     draft_model: Transformer,
     cur_token: torch.Tensor,
     input_pos: int,
     speculate_k: int,
-    **sampling_kwargs
+    **sampling_kwargs,
 ) -> torch.Tensor:
     # draft model inference sequentially
     device = cur_token.device
     orig_input_pos = torch.tensor([input_pos], dtype=torch.int64, device=cur_token.device)
-    draft_tokens, draft_probs = decode_n_tokens(draft_model, cur_token.view(1, -1), orig_input_pos.clone(), speculate_k, **sampling_kwargs)
+    draft_tokens, draft_probs = decode_n_tokens(
+        draft_model, cur_token.view(1, -1), orig_input_pos.clone(), speculate_k, **sampling_kwargs
+    )
 
     draft_tokens = torch.cat(draft_tokens)
     # parallel inference on target model using draft tokens
     target_logits = model_forward(
         model,
         torch.cat([cur_token.view(1), draft_tokens]).view(1, -1),
-        torch.arange(input_pos, input_pos + speculate_k + 1, device=cur_token.device)
+        torch.arange(input_pos, input_pos + speculate_k + 1, device=cur_token.device),
     )
     target_probs = logits_to_probs(target_logits[0], **sampling_kwargs)
     draft_probs = torch.stack(draft_probs)
@@ -182,10 +206,10 @@ def speculative_decode(
     # q < p: q/p prob to accept draft token
     p = draft_probs[torch.arange(0, speculate_k, device=device), draft_tokens]
     q = target_probs[torch.arange(0, speculate_k, device=device), draft_tokens]
-    accept_draft_prob = torch.minimum(torch.ones(()), q[:speculate_k]/ p)
+    accept_draft_prob = torch.minimum(torch.ones(()), q[:speculate_k] / p)
     rejected_locations = (torch.rand_like(accept_draft_prob) > accept_draft_prob).nonzero()
 
-    if rejected_locations.shape[0] == 0: # All draft tokens have been accepted
+    if rejected_locations.shape[0] == 0:  # All draft tokens have been accepted
         accept_length = speculate_k + 1
         last_token = multinomial_sample_one_no_sync(target_probs[-1])
         # fill last token into draft model
@@ -205,6 +229,7 @@ def speculative_decode(
         next_token = multinomial_sample_one_no_sync(new)
         return torch.cat([draft_tokens[:accept_length], next_token])
 
+
 @torch.no_grad()
 def generate(
     model: Transformer,
@@ -215,9 +240,9 @@ def generate(
     interactive: bool,
     draft_model: Transformer,
     speculate_k: Optional[int] = 8,
-    callback = lambda x: x,
+    callback=lambda x: x,
     print_tokens=False,
-    **sampling_kwargs
+    **sampling_kwargs,
 ) -> torch.Tensor:
     """
     Takes a conditioning sequence (prompt) as input and continues to generate as many tokens as requested.
@@ -233,7 +258,7 @@ def generate(
     # pad to batch size
     # if prompt.size(0) < batch_size:
     #     prompt = F.pad(prompt.clone(), (0, 0, 0, batch_size - prompt.size(0)), value=tokenizer.pad_id())
-    
+
     # T_new = T + max_new_tokens
     # if interactive:
     #     max_seq_length = 350
@@ -264,7 +289,9 @@ def generate(
     next_token = prefill(model, prompt, input_pos, **sampling_kwargs).clone()
     # set to 256001 if the final prompt token is 256001
     prompt_last_tokens = prompt[:, -2:-1]
-    next_token = torch.where(prompt_last_tokens == 256001, torch.tensor(256001, device=device, dtype=torch.int), next_token)
+    next_token = torch.where(
+        prompt_last_tokens == 256001, torch.tensor(256001, device=device, dtype=torch.int), next_token
+    )
     # print("Initial next_ids", next_token)
     # if is_speculative:
     #     prefill(draft_model, prompt.view(batch_size, -1), input_pos, **sampling_kwargs)
@@ -289,12 +316,20 @@ def generate(
     #         input_pos = input_pos + num_added
     #         next_token = next_tokens[-1]
     # else:
-    
+
     input_pos = torch.tensor([T], device=device, dtype=torch.int)
 
     max_new_tokens = max_seq_len - num_prompt_tokens - 1
     time0 = time.time()
-    generated_ids = decode_n_tokens(model, next_token.view(batch_size, -1), input_pos, max_new_tokens - 1, callback=callback, print_tokens=print_tokens, **sampling_kwargs)
+    generated_ids = decode_n_tokens(
+        model,
+        next_token.view(batch_size, -1),
+        input_pos,
+        max_new_tokens - 1,
+        callback=callback,
+        print_tokens=print_tokens,
+        **sampling_kwargs,
+    )
     time1 = time.time()
 
     # print('prompt', prompt)
@@ -302,7 +337,7 @@ def generate(
     # seq = torch.cat([prompt, torch.cat(generated_ids, dim=-1)], dim=-1)
     generated_ids = torch.cat(generated_ids, dim=-1)
     n_generated = generated_ids.size(-1)
-    seq[:, T:T+n_generated] = generated_ids
+    seq[:, T : T + n_generated] = generated_ids
     # print('seq', seq)
 
     # print("Time to generate batch", time1 - time0)
@@ -310,25 +345,27 @@ def generate(
     # generate_stats = {
     #     'accept_counts': accept_counts
     # }
-    return seq, (generated_ids, time1-time0)
+    return seq, (generated_ids, time1 - time0)
+
 
 # Input prompt is already in chat format, so need to preprocess it to just the prompt
 # Assumes it is in the chat template
 def preprocess_prompt(prompt: str) -> str:
     return prompt.split("<|im_start|>user\n")[1].split("<|im_end|>")[0]
 
+
 def generate_outline(
     tokenizer: SentencePieceProcessor,
-    model: Transformer, 
-    max_seq_len: int, 
-    device: str, 
-    draft_model: Transformer, 
-    speculate_k: int, 
-    interactive: bool, 
-    callback, 
-    temperature: float, 
+    model: Transformer,
+    max_seq_len: int,
+    device: str,
+    draft_model: Transformer,
+    speculate_k: int,
+    interactive: bool,
+    callback,
+    temperature: float,
     top_k: int,
-    prompt: str
+    prompt: str,
 ) -> Tuple[torch.Tensor, int]:
     outline_prompt = (
         f"You're an organizer responsible for only giving the skeleton (not the full content) for answering the question. "
@@ -361,13 +398,14 @@ def generate_outline(
     )
     return outline_decode_tokens, outline_decode_time
 
+
 # Breakdown the outline into individual points using regex (Second part)
 def break_down_outline(outline: str):
     # Use regex to extract points
     # Added \. to the end of the regex to ensure that the last point is also captured
     # this is an improvement to SOT
     re_result = re.findall(r"(\d+)\.\s?([\s\S]+?)(?=\.|\n|\n*$)", outline)
-    
+
     if len(re_result) > 0:
         points, point_outlines = zip(*re_result)
     else:
@@ -377,16 +415,17 @@ def break_down_outline(outline: str):
     # print("Point outlines extracted: ", point_outlines)
     return points, point_outlines
 
+
 def generate_point_content(
     tokenizer: SentencePieceProcessor,
-    model: Transformer, 
-    max_seq_len: int, 
-    device: str, 
-    draft_model: Transformer, 
-    speculate_k: int, 
-    interactive: bool, 
-    callback, 
-    temperature: float, 
+    model: Transformer,
+    max_seq_len: int,
+    device: str,
+    draft_model: Transformer,
+    speculate_k: int,
+    interactive: bool,
+    callback,
+    temperature: float,
     top_k: int,
     prompt: str,
     outline: str,
@@ -412,7 +451,9 @@ def generate_point_content(
 
         # point_prompt_encoded = encode_tokens(tokenizer, point_prompt, use_chat=True, bos=True, device=device)
         starter = f"{point}. {point_outline}"
-        point_prompt_encoded = encode_tokens(tokenizer, point_prompt, use_chat=True, starter= starter, bos=True, device=device)
+        point_prompt_encoded = encode_tokens(
+            tokenizer, point_prompt, use_chat=True, starter=starter, bos=True, device=device
+        )
 
         all_point_starters.append(encode_tokens(tokenizer, starter, device=device)[0])
         all_point_prompts.append(point_prompt_encoded)
@@ -422,9 +463,11 @@ def generate_point_content(
         if point == "1":
             print(f"Point {point} prompt: ", tokenizer.DecodeIds(point_prompt_encoded.tolist()[0]))
 
-    # pad left 
+    # pad left
     for i in range(len(all_point_prompts)):
-        all_point_prompts[i] = F.pad(all_point_prompts[i], (max_prompt_len - all_point_prompts[i].size(1), 0), value=tokenizer.pad_id())
+        all_point_prompts[i] = F.pad(
+            all_point_prompts[i], (max_prompt_len - all_point_prompts[i].size(1), 0), value=tokenizer.pad_id()
+        )
 
     all_point_prompts = torch.cat(all_point_prompts, dim=0)
 
@@ -442,17 +485,17 @@ def generate_point_content(
         # print_tokens=True,
     )
 
-    NEWLINE_TOKEN = torch.tensor(tokenizer.encode('\n'), dtype=torch.int, device=device).item()
+    NEWLINE_TOKEN = torch.tensor(tokenizer.encode("\n"), dtype=torch.int, device=device).item()
     # print('newline token', NEWLINE_TOKEN)
     newline_tensor = torch.ones((content_tokens.size(0), 1), dtype=torch.int, device=device) * NEWLINE_TOKEN
 
-    print('content_tokens shape', content_tokens.shape)
-    print('newline_tensor shape', newline_tensor.shape)
-    print('starter shape', len(all_point_starters))
+    print("content_tokens shape", content_tokens.shape)
+    print("newline_tensor shape", newline_tensor.shape)
+    print("starter shape", len(all_point_starters))
 
     # print("all point starters: ")
     # for i in range(len(all_point_starters)):
-        # print(f"starter {i+1}", tokenizer.DecodeIds(all_point_starters[i].tolist()))
+    # print(f"starter {i+1}", tokenizer.DecodeIds(all_point_starters[i].tolist()))
 
     points_tokens = []
     point_strs = []
@@ -463,7 +506,7 @@ def generate_point_content(
         print(f"point {i+1} content:", tokenizer.DecodeIds(tokens_list))
         # Extract content until <im_end>
         if 256001 in content_tokens[i].tolist():
-            real_content = content_tokens[i][:content_tokens[i].tolist().index(256001)]
+            real_content = content_tokens[i][: content_tokens[i].tolist().index(256001)]
         else:
             real_content = content_tokens[i]
 
@@ -473,12 +516,11 @@ def generate_point_content(
         cur_point_tokens = torch.cat([all_point_starters[i], real_content, newline_tensor[i]], dim=-1)
         points_tokens.append(cur_point_tokens)
 
-        cur_point_tokens_list:list = cur_point_tokens.tolist()
+        cur_point_tokens_list: list = cur_point_tokens.tolist()
         if 256001 in cur_point_tokens_list:
-            cur_point_tokens_list = cur_point_tokens_list[:cur_point_tokens_list.index(256001) + 1]
+            cur_point_tokens_list = cur_point_tokens_list[: cur_point_tokens_list.index(256001) + 1]
         point_strs.append(tokenizer.DecodeIds(cur_point_tokens_list))
 
-    
     points_tokens = torch.cat(points_tokens, dim=0)
     print("points shape", points_tokens.shape)
     # print("points generated: ", tokenizer.DecodeIds(points_tokens.tolist()))
@@ -487,6 +529,7 @@ def generate_point_content(
     points_tokens[-1] = 256001
 
     return points_tokens.reshape(1, -1), point_decode_time, point_strs
+
 
 def sot_generate(
     model: Transformer,
@@ -497,17 +540,17 @@ def sot_generate(
     interactive: bool,
     draft_model: Transformer,
     speculate_k: Optional[int] = 8,
-    callback = lambda x: x,
-    device='cuda',
-    **sampling_kwargs
+    callback=lambda x: x,
+    device="cuda",
+    **sampling_kwargs,
 ) -> torch.Tensor:
     torch.manual_seed(42)
-    
+
     temperature = sampling_kwargs["temperature"]
     top_k = sampling_kwargs["top_k"]
 
     prompt = preprocess_prompt(prompt)
-    
+
     t0 = time.time()
 
     # Step 1: Generate outline
@@ -525,16 +568,16 @@ def sot_generate(
         prompt,
     )
     # truncate outline tokens to 256001
-    outline_tokens_list:list = outline_tokens.tolist()[0]
+    outline_tokens_list: list = outline_tokens.tolist()[0]
     if 256001 in outline_tokens_list:
-        outline_tokens_list = outline_tokens_list[:outline_tokens_list.index(256001)+1]
+        outline_tokens_list = outline_tokens_list[: outline_tokens_list.index(256001) + 1]
         og_outline = "1." + tokenizer.DecodeIds(outline_tokens_list[:-1])
         og_outline_str = "1." + tokenizer.DecodeIds(outline_tokens_list)
     else:
         og_outline = "1." + tokenizer.DecodeIds(outline_tokens_list)
         og_outline_str = "1." + tokenizer.DecodeIds(outline_tokens_list)
     # og_outline = tokenizer.DecodeIds(outline_tokens.tolist()[0])
-    
+
     print("Outline time: ", outline_decode_time)
     print("Outline generated: ", og_outline)
 
@@ -542,7 +585,7 @@ def sot_generate(
     points, point_outlines = break_down_outline(og_outline)
 
     print("Got a total of", len(points), "points")
-    
+
     # Improvement from SOT: dedup by point outline not point indices
     # Deduplicate points
     point_outlines_filtered = []
@@ -582,9 +625,8 @@ def sot_generate(
         outline,
         point_outlines,
     )
-    
-    t1 = time.time()
 
+    t1 = time.time()
 
     # Format in the expected way
     prompt_tokens = encode_tokens(tokenizer, prompt, use_chat=True, bos=True, device=device)
@@ -596,14 +638,23 @@ def sot_generate(
     print("seq", seq)
     print("seq text", tokenizer.DecodeIds(seq.tolist()[0]))
 
-    return seq, (points_tokens, outline_tokens, points_decode_time, outline_decode_time, og_outline_str, point_strs, t1 - t0)
+    return seq, (
+        points_tokens,
+        outline_tokens,
+        points_decode_time,
+        outline_decode_time,
+        og_outline_str,
+        point_strs,
+        t1 - t0,
+    )
 
 
-def encode_tokens(tokenizer, string, starter=None, use_chat=False, bos=True, device='cuda'):
+def encode_tokens(tokenizer, string, starter=None, use_chat=False, bos=True, device="cuda"):
     if use_chat:
         # Hardcode it bc we will only have a single user prompt message
         system_prompt = "You are a helpful AI assistant"
-        string = f"<|im_start|>system\n{system_prompt}<|im_end|>\n<|im_start|>user\n{string}<|im_end|>\n<|im_start|>assistant\n"
+        # string = f"<|im_start|>system\n{system_prompt}<|im_end|>\n<|im_start|>user\n{string}<|im_end|>\n<|im_start|>assistant\n"
+        string = f"<start_of_turn>user\n{string}<end_of_turn>\n<start_of_turn>model\n"
         if starter:
             string += starter
 
@@ -614,7 +665,7 @@ def encode_tokens(tokenizer, string, starter=None, use_chat=False, bos=True, dev
 
 
 def _load_model(checkpoint_path, device, precision, use_tp, resize_embedding=None, model_name=None):
-    with torch.device('meta'):
+    with torch.device("meta"):
         model_name = model_name or checkpoint_path.parent.name
         model = Transformer.from_name(model_name)
 
@@ -641,7 +692,7 @@ def _load_model(checkpoint_path, device, precision, use_tp, resize_embedding=Non
         old_tok_embedding_weight = model.tok_embeddings.weight
         _, embed_dim = old_tok_embedding_weight.shape
         model.tok_embeddings = torch.nn.Embedding(resize_embedding, embed_dim)
-        model.tok_embeddings.weight.data[:old_tok_embedding_weight.size(0)] = old_tok_embedding_weight
+        model.tok_embeddings.weight.data[: old_tok_embedding_weight.size(0)] = old_tok_embedding_weight
 
     # if use_tp:
     #     from tp import apply_tp
@@ -651,7 +702,9 @@ def _load_model(checkpoint_path, device, precision, use_tp, resize_embedding=Non
     model = model.to(device=device, dtype=precision)
     return model.eval()
 
+
 B_INST, E_INST = "[INST]", "[/INST]"
+
 
 def main_fn(
     prompt: str = "Hello, my name is",
@@ -666,7 +719,7 @@ def main_fn(
     profile: Optional[Path] = None,
     draft_checkpoint_path: Optional[str] = None,
     speculate_k: int = 5,
-    device='cuda',
+    device="cuda",
     input_file=None,
     resize_embedding=None,
     model_name=None,
@@ -680,7 +733,7 @@ def main_fn(
 
     checkpoint_path = Path(checkpoint_path)
     draft_checkpoint_path = Path(draft_checkpoint_path) if draft_checkpoint_path else None
-    
+
     tokenizer_path = checkpoint_path.parent / "tokenizer.model"
     # assert tokenizer_path.is_file(), tokenizer_path
 
@@ -714,53 +767,53 @@ def main_fn(
     else:
         draft_model = None
 
-    device_sync(device=device) # MKG
+    device_sync(device=device)  # MKG
     print(f"Time to load model: {time.time() - t0:.02f} seconds")
 
-# LOCAL-BEGIN
+    # LOCAL-BEGIN
     m = sentencepiece_model_pb2.ModelProto()
-    m.ParseFromString(open(tokenizer_path, "rb").read())                                                 
-# LOCAL-END
-    
-# GOOGLE-BEGIN
-#     m = sentencepiece_model_pb2.ModelProto()
-#     m.ParseFromString(
-#         gfile.Open(
-#             "/cns/sc-d/home/suvinay/checkpoints/gemma/gemma-7b/tokenizer.model",
-#             "rb",
-#         ).read()
-#     )
-# GOOGLE-END
+    m.ParseFromString(open(tokenizer_path, "rb").read())
+    # LOCAL-END
+
+    # GOOGLE-BEGIN
+    #     m = sentencepiece_model_pb2.ModelProto()
+    #     m.ParseFromString(
+    #         gfile.Open(
+    #             "/cns/sc-d/home/suvinay/checkpoints/gemma/gemma-7b/tokenizer.model",
+    #             "rb",
+    #         ).read()
+    #     )
+    # GOOGLE-END
 
     tokenizer = SentencePieceProcessor()
     tokenizer.LoadFromSerializedProto(m.SerializeToString())
     special_tokens = ["<|im_start|>", "<|im_end|>"]
 
-    for token in special_tokens:
-        new_token = m.SentencePiece()
-        new_token.piece = token
-        new_token.score = 0
-        new_token.type = 4 # type value for USER_DEFINED
-        m.pieces.append(new_token)
+    # for token in special_tokens:
+    #     new_token = m.SentencePiece()
+    #     new_token.piece = token
+    #     new_token.score = 0
+    #     new_token.type = 4 # type value for USER_DEFINED
+    #     m.pieces.append(new_token)
 
     print("Vocab size:", len(m.pieces))
 
-# LOCAL-BEGIN
+    # LOCAL-BEGIN
     tokenizer = SentencePieceProcessor(model_proto=m.SerializeToString())
-# LOCAL-END
+    # LOCAL-END
 
-# GOOGLE-BEGIN
-#     tokenizer = SentencePieceProcessor()
-#     tokenizer.LoadFromSerializedProto(m.SerializeToString())
-# GOOGLE-END
+    # GOOGLE-BEGIN
+    #     tokenizer = SentencePieceProcessor()
+    #     tokenizer.LoadFromSerializedProto(m.SerializeToString())
+    # GOOGLE-END
 
     _debug_tokenizer = tokenizer
 
     model_size = sum([p.numel() * p.dtype.itemsize for p in itertools.chain(model.parameters(), model.buffers())])
     if _compile:
         print("compiling...")
-        if is_speculative and use_tp: # and ("cuda" in device):
-            torch._inductor.config.triton.cudagraph_trees = False # Bug with cudagraph trees in this case
+        if is_speculative and use_tp:  # and ("cuda" in device):
+            torch._inductor.config.triton.cudagraph_trees = False  # Bug with cudagraph trees in this case
 
         if is_speculative:
             global model_forward, logits_to_prob
@@ -769,10 +822,10 @@ def main_fn(
         global decode_one_token, prefill
 
         fullgraph = True
-# CHECK-BEGIN
-#         fullgraph = False
-# CHECK-END
-        
+        # CHECK-BEGIN
+        #         fullgraph = False
+        # CHECK-END
+
         decode_one_token = torch.compile(decode_one_token, mode="max-autotune", fullgraph=fullgraph)
 
         # Uncomment to squeeze more perf out of prefill
@@ -793,18 +846,18 @@ def main_fn(
                 print(f"Rank is {eval_rank}/{world_size}")
                 # Take only the configs that are divisible by world_size
                 all_configs = all_configs[eval_rank::world_size]
-            
+
             for config in all_configs:
                 name = config["name"]
                 prompt = config["prompt"]
                 name_to_configs[name] = prompt
-    
+
     output_file = str(output_file)
     if eval_rank is not None:
         # insert .{eval_rank} before the extension
         output_file = Path(output_file)
         output_file = output_file.with_name(output_file.stem + f".{eval_rank}" + output_file.suffix)
-    
+
     try:
         with open(output_file, "r") as f:
             pass
@@ -820,15 +873,15 @@ def main_fn(
         prompt_length = encoded.size(0)
 
         aggregate_metrics = {
-            'tokens_per_sec': [],
-            'accept_counts': [],
+            "tokens_per_sec": [],
+            "accept_counts": [],
         }
         start = -1 if _compile else 0
 
         torch.manual_seed(1234)
         for i in range(start, num_samples):
             print(f"Sample {i + 1} of {num_samples}")
-            device_sync(device=device) # MKG
+            device_sync(device=device)  # MKG
             # if i >= 0 and interactive:
             #     prompt = input("What is your prompt? ")
             #     if is_chat:
@@ -851,9 +904,10 @@ def main_fn(
             #             buffer.clear()
             #         # print(, end='', flush=True)
             # else:
-            callback = lambda x : x
+            callback = lambda x: x
             t0 = time.perf_counter()
             import contextlib
+
             if (i != num_samples - 1 or not profile) or (use_tp and rank != 0):
                 prof = contextlib.nullcontext()
             else:
@@ -862,16 +916,17 @@ def main_fn(
                 prof = torch.profiler.profile()
 
             print("Generating...")
-            
+
             with prof as p:
                 if sot:
-                    y, (point_tokens, 
-                        outline_tokens, 
+                    y, (
+                        point_tokens,
+                        outline_tokens,
                         points_decode_time,
                         outline_decode_time,
                         og_outline,
                         point_strs,
-                        total_time
+                        total_time,
                     ) = sot_generate(
                         model,
                         tokenizer,
@@ -918,45 +973,47 @@ def main_fn(
                     prof.export_chrome_trace(f"{profile}_rank_{rank}.json")
                 else:
                     prof.export_chrome_trace(f"{profile}.json")
-            device_sync(device=device) # MKG
+            device_sync(device=device)  # MKG
             t = time.perf_counter() - t0
             # print('ylist shape', f"({len(y.tolist())}, {len(y.tolist()[0])})")
 
             output = tokenizer.DecodeIds(y.tolist()[0])
             print(output)
-            
+
             tokens_sec = tokens_generated / decode_time
-            aggregate_metrics['tokens_per_sec'].append(tokens_sec)
+            aggregate_metrics["tokens_per_sec"].append(tokens_sec)
             print(f"Tokens generated: {tokens_generated}, time taken: {t:.02f} sec")
             print(f"Time for inference {i + 1}: {t:.02f} sec total, {tokens_sec:.02f} tokens/sec")
             print(f"Bandwidth achieved: {model_size * tokens_sec / 1e9:.02f} GB/s")
         print("==========")
         if is_speculative:
-            counts_aggregated = [sum(i) for i in zip(*aggregate_metrics['accept_counts'])]
-            acceptance_probs = [i/sum(counts_aggregated) for i in counts_aggregated]
+            counts_aggregated = [sum(i) for i in zip(*aggregate_metrics["accept_counts"])]
+            acceptance_probs = [i / sum(counts_aggregated) for i in counts_aggregated]
             print(f"Acceptance probs: {acceptance_probs}")
             print(f"Mean Accepted: {sum([idx * i for idx, i in enumerate(counts_aggregated)])/sum(counts_aggregated)}")
 
         print(f"Average tokens/sec: {torch.mean(torch.tensor(aggregate_metrics['tokens_per_sec'])).item():.2f}")
         print(f"Memory used: {torch.cuda.max_memory_reserved() / 1e9:.02f} GB")
-        
+
         json_result = {
             "name": name,
-            "tokens_per_sec": aggregate_metrics['tokens_per_sec'],
+            "tokens_per_sec": aggregate_metrics["tokens_per_sec"],
             "decode_time": decode_time,
             "output": output,
-# CHECK-BEGIN
-#             "inconsistency_with_reference": ctx.inconsistency_with_reference,
-# CHECK-END
+            # CHECK-BEGIN
+            #             "inconsistency_with_reference": ctx.inconsistency_with_reference,
+            # CHECK-END
         }
         if sot:
-            json_result.update({
-                "outline_time": outline_decode_time,
-                "points_time": points_decode_time,
-                "total_time": total_time,
-                "outline": og_outline,
-                "point_strs": point_strs,
-            })
+            json_result.update(
+                {
+                    "outline_time": outline_decode_time,
+                    "points_time": points_decode_time,
+                    "total_time": total_time,
+                    "outline": og_outline,
+                    "point_strs": point_strs,
+                }
+            )
         log_file.write(json.dumps(json_result) + "\n")
         print(f"JSON: {json.dumps(json_result)}")
 
@@ -964,28 +1021,30 @@ def main_fn(
 def main(argv):
     del argv
     print("Compile flag is ", FLAGS.compile)
-    main_fn(FLAGS.prompt,
-            FLAGS.interactive,
-            FLAGS.num_samples,
-            FLAGS.max_seq_len,
-            FLAGS.top_k,
-            FLAGS.temperature,
-            FLAGS.checkpoint_path,
-            FLAGS.compile,
-            FLAGS.compile_prefill,
-            FLAGS.profile,
-            FLAGS.draft_checkpoint_path,
-            FLAGS.speculate_k,
-            FLAGS.device,
-            FLAGS.input_file,
-            FLAGS.resize_embedding,
-            FLAGS.model_name,
-            FLAGS.output_file,
-            FLAGS.sot,
-        )
+    main_fn(
+        FLAGS.prompt,
+        FLAGS.interactive,
+        FLAGS.num_samples,
+        FLAGS.max_seq_len,
+        FLAGS.top_k,
+        FLAGS.temperature,
+        FLAGS.checkpoint_path,
+        FLAGS.compile,
+        FLAGS.compile_prefill,
+        FLAGS.profile,
+        FLAGS.draft_checkpoint_path,
+        FLAGS.speculate_k,
+        FLAGS.device,
+        FLAGS.input_file,
+        FLAGS.resize_embedding,
+        FLAGS.model_name,
+        FLAGS.output_file,
+        FLAGS.sot,
+    )
 
-if __name__ == '__main__':
-# LOCAL-BEGIN
+
+if __name__ == "__main__":
+    # LOCAL-BEGIN
     app.run(main)
 # LOCAL-END
 
