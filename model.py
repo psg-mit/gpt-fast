@@ -94,21 +94,33 @@ class Transformer(nn.Module):
         self.norm = RMSNorm(config.dim, eps=config.norm_eps)
         self.output = nn.Linear(config.dim, config.vocab_size, bias=False)
 
+        self.caches = {}
+
         self.freqs_cis: Optional[Tensor] = None
         self.mask_cache: Optional[Tensor] = None
         self.max_batch_size = -1
         self.max_seq_length = -1
 
     def setup_caches(self, max_batch_size, max_seq_length):
+        max_seq_length = find_multiple(max_seq_length, 8)
+        
         if self.max_seq_length == max_seq_length and self.max_batch_size == max_batch_size:
             return
         # if self.max_seq_length >= max_seq_length and self.max_batch_size >= max_batch_size:
         #     return
-        max_seq_length = find_multiple(max_seq_length, 8)
+        if (max_batch_size, max_seq_length) in self.caches:
+            caches = self.caches[(max_batch_size, max_seq_length)]
+        else:
+            print(f"Initializing caches for {max_batch_size}x{max_seq_length}")
+            caches = [KVCache(max_batch_size, max_seq_length, self.config.n_local_heads, self.config.head_dim) for _ in range(len(self.layers))]
+            self.caches[(max_batch_size, max_seq_length)] = caches
+        
         self.max_seq_length = max_seq_length
         self.max_batch_size = max_batch_size
-        for b in self.layers:
-            b.attention.kv_cache = KVCache(max_batch_size, max_seq_length, self.config.n_local_heads, self.config.head_dim)
+        for i, b in enumerate(self.layers):
+            b.attention.kv_cache = caches[i]
+        # for b in self.layers:
+        #     b.attention.kv_cache = KVCache(max_batch_size, max_seq_length, self.config.n_local_heads, self.config.head_dim)
 
         self.freqs_cis = precompute_freqs_cis(10 * self.config.block_size, self.config.head_dim, self.config.rope_base)
         self.causal_mask = torch.tril(torch.ones(self.max_seq_length, self.max_seq_length, dtype=torch.bool))
