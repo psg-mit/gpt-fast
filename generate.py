@@ -68,6 +68,8 @@ flags.DEFINE_string("positional_encoding_mode", "const-40", "positional encoding
 flags.DEFINE_boolean("sot", False, "Whether to use sot")
 
 MAX_BATCH_SIZE = 8
+MAX_OUTLINE_SEQ_LEN = 500
+MAX_CONTENT_SEQ_LEN = 1500
 
 
 def device_sync(device):
@@ -389,7 +391,7 @@ def generate_outline(
         model,
         tokenizer,
         outline_encoded,
-        max_seq_len,
+        MAX_OUTLINE_SEQ_LEN,
         draft_model=draft_model,
         speculate_k=speculate_k,
         interactive=interactive,
@@ -477,7 +479,7 @@ def generate_point_content(
         model,
         tokenizer,
         all_point_prompts,
-        max_seq_len,
+        MAX_CONTENT_SEQ_LEN,
         draft_model=draft_model,
         speculate_k=speculate_k,
         interactive=interactive,
