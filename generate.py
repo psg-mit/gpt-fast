@@ -65,7 +65,7 @@ flags.DEFINE_string("output_file", None, "output file")
 flags.DEFINE_string("positional_encoding_mode", "const-40", "positional encoding mode")
 flags.DEFINE_boolean("sot", False, "Whether to use sot")
 
-MAX_BATCH_SIZE = 8
+MAX_BATCH_SIZE = 10
 MAX_OUTLINE_SEQ_LEN = 500
 MAX_CONTENT_SEQ_LEN = 1500
 
@@ -244,28 +244,19 @@ def generate(
     # create an empty tensor of the expected final shape and fill in the current tokens
     T = prompt.size(-1)
     num_prompt_tokens = T
-    batch_size = prompt.size(0)
-    # batch_size = MAX_BATCH_SIZE
+    # batch_size = prompt.size(0)
+    batch_size = MAX_BATCH_SIZE
 
     # pad to batch size
-    # if prompt.size(0) < batch_size:
-    #     prompt = F.pad(prompt.clone(), (0, 0, 0, batch_size - prompt.size(0)), value=tokenizer.pad_id())
-    
-    # T_new = T + max_new_tokens
-    # if interactive:
-    #     max_seq_length = 350
-    # else:
-    #     max_seq_length = min(T_new, model.config.block_size)
+    if prompt.size(0) < batch_size:
+        prompt = F.pad(prompt.clone(), (0, 0, 0, batch_size - prompt.size(0)), value=tokenizer.pad_id())
 
     # print("batch_size", batch_size)
     # print("max_seq_len", max_seq_len)
 
     device, dtype = prompt.device, prompt.dtype
-    # max_seq_length = max_seq_length + speculate_k + 1 if is_speculative else max_seq_length
     with torch.device(device):
         model.setup_caches(max_batch_size=batch_size, max_seq_length=max_seq_len)
-        # if is_speculative and draft_model is not model:
-        #     draft_model.setup_caches(max_batch_size=batch_size, max_seq_length=max_seq_length)
 
     # create an empty tensor of the expected final shape and fill in the current tokens
     empty = torch.ones(batch_size, max_seq_len, dtype=dtype, device=device)
@@ -277,6 +268,9 @@ def generate(
     # print("prompt", prompt.view(batch_size, -1))
     # print("cache batch size", model.max_batch_size)
     # print("cache seq length", model.max_seq_length)
+
+    # print("prompt shape", prompt.shape)
+    # print("input_pos shape", input_pos.shape)
 
     next_token = prefill(model, prompt, input_pos, **sampling_kwargs).clone()
     # set to 256001 if the final prompt token is 256001
@@ -312,6 +306,9 @@ def generate(
     input_pos = torch.tensor([T], device=device, dtype=torch.int)
 
     max_new_tokens = max_seq_len - num_prompt_tokens - 1
+    print("max_seq_len", max_seq_len)
+    print("num_prompt_tokens", num_prompt_tokens)
+    print("max_new_tokens", max_new_tokens)
     time0 = time.time()
     generated_ids = decode_n_tokens(
         model,
