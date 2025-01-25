@@ -134,6 +134,7 @@ def decode_one_token(
 
 def decode_n_tokens(
     model: Transformer,
+    tokenizer: SentencePieceProcessor,
     cur_token: torch.Tensor,
     input_pos: torch.Tensor,
     num_new_tokens: int,
@@ -148,7 +149,7 @@ def decode_n_tokens(
         with torch.backends.cuda.sdp_kernel(
             enable_flash=False, enable_mem_efficient=False, enable_math=True
         ):  # Actually better for Inductor to codegen attention here
-            is_done = [a or b[0] == 256001 for a, b in zip(is_done, cur_token.clone().tolist())]
+            is_done = [a or b[0] == tokenizer.eos_id() for a, b in zip(is_done, cur_token.clone().tolist())]
             if print_tokens:
                 print("iteration:", i)
                 print("starting tokens:", cur_token.clone().tolist())
@@ -162,7 +163,7 @@ def decode_n_tokens(
             input_pos += 1
             # if cur token is 256001, then set next token to 256001
             next_token = torch.where(
-                cur_token == 256001, torch.tensor(256001, device=cur_token.device, dtype=torch.int), next_token
+                cur_token == tokenizer.eos_id(), tokenizer.eos_id(), next_token
             )
             new_tokens.append(next_token.clone())
             callback(new_tokens[-1])
@@ -290,7 +291,7 @@ def generate(
     # set to 256001 if the final prompt token is 256001
     prompt_last_tokens = prompt[:, -2:-1]
     next_token = torch.where(
-        prompt_last_tokens == 256001, torch.tensor(256001, device=device, dtype=torch.int), next_token
+        prompt_last_tokens == tokenizer.eos_id(), tokenizer.eos_id(), next_token
     )
     # print("Initial next_ids", next_token)
     # if is_speculative:
@@ -323,6 +324,7 @@ def generate(
     time0 = time.time()
     generated_ids = decode_n_tokens(
         model,
+        tokenizer,
         next_token.view(batch_size, -1),
         input_pos,
         max_new_tokens - 1,
@@ -440,8 +442,8 @@ def generate_point_content(
     for point_i, point_outline in enumerate(point_outlines):
         point = str(point_i + 1)
         point_outline = point_outline.strip()
-        # if point_outline[-1] == ".":
-        #     point_outline = point_outline[:-1]
+        if point_outline[-1] != ".":
+            point_outline = point_outline + "."
 
         point_prompt = (
             f"You're responsible for continuing the writing of one and only one point in the overall answer to the following question.\n\n"
@@ -502,13 +504,15 @@ def generate_point_content(
     # print("content tokens: ")
     for i in range(len(all_point_starters)):
         # replace 256001 with eos token
-        tokens_list = [x if x != 1 else 256001 for x in content_tokens[i].tolist()]
+        # tokens_list = [x if x != 1 else 256001 for x in content_tokens[i].tolist()]
+        tokens_list = content_tokens[i].tolist()
         print(f"point {i+1} content:", tokenizer.DecodeIds(tokens_list))
         # Extract content until <im_end>
-        if 256001 in content_tokens[i].tolist():
-            real_content = content_tokens[i][: content_tokens[i].tolist().index(256001)]
-        else:
-            real_content = content_tokens[i]
+        # if 256001 in content_tokens[i].tolist():
+        #     real_content = content_tokens[i][: content_tokens[i].tolist().index(256001)]
+        # else:
+        #     real_content = content_tokens[i]
+        real_content = content_tokens[i]
 
         print(f"point {i} all point starters: ", all_point_starters[i].shape)
         print(f"point {i} content tokens: ", real_content.shape)
@@ -517,8 +521,8 @@ def generate_point_content(
         points_tokens.append(cur_point_tokens)
 
         cur_point_tokens_list: list = cur_point_tokens.tolist()
-        if 256001 in cur_point_tokens_list:
-            cur_point_tokens_list = cur_point_tokens_list[: cur_point_tokens_list.index(256001) + 1]
+        # if 256001 in cur_point_tokens_list:
+        #     cur_point_tokens_list = cur_point_tokens_list[: cur_point_tokens_list.index(256001) + 1]
         point_strs.append(tokenizer.DecodeIds(cur_point_tokens_list))
 
     points_tokens = torch.cat(points_tokens, dim=0)
@@ -526,7 +530,7 @@ def generate_point_content(
     # print("points generated: ", tokenizer.DecodeIds(points_tokens.tolist()))
 
     # replace the last newline token with eos token
-    points_tokens[-1] = 256001
+    points_tokens[-1] = tokenizer.eos_id()
 
     return points_tokens.reshape(1, -1), point_decode_time, point_strs
 
@@ -569,13 +573,13 @@ def sot_generate(
     )
     # truncate outline tokens to 256001
     outline_tokens_list: list = outline_tokens.tolist()[0]
-    if 256001 in outline_tokens_list:
-        outline_tokens_list = outline_tokens_list[: outline_tokens_list.index(256001) + 1]
-        og_outline = "1." + tokenizer.DecodeIds(outline_tokens_list[:-1])
-        og_outline_str = "1." + tokenizer.DecodeIds(outline_tokens_list)
-    else:
-        og_outline = "1." + tokenizer.DecodeIds(outline_tokens_list)
-        og_outline_str = "1." + tokenizer.DecodeIds(outline_tokens_list)
+    # if 256001 in outline_tokens_list:
+    #     outline_tokens_list = outline_tokens_list[: outline_tokens_list.index(256001) + 1]
+    #     og_outline = "1." + tokenizer.DecodeIds(outline_tokens_list[:-1])
+    #     og_outline_str = "1." + tokenizer.DecodeIds(outline_tokens_list)
+    # else:
+    og_outline = "1." + tokenizer.DecodeIds(outline_tokens_list)
+    og_outline_str = "1." + tokenizer.DecodeIds(outline_tokens_list)
     # og_outline = tokenizer.DecodeIds(outline_tokens.tolist()[0])
 
     print("Outline time: ", outline_decode_time)
@@ -795,6 +799,8 @@ def main_fn(
     #     new_token.score = 0
     #     new_token.type = 4 # type value for USER_DEFINED
     #     m.pieces.append(new_token)
+    #     tokenizer.eos_id = lambda: 256001
+    
 
     print("Vocab size:", len(m.pieces))
 
