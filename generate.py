@@ -66,7 +66,7 @@ flags.DEFINE_string("positional_encoding_mode", "const-40", "positional encoding
 flags.DEFINE_boolean("sot", False, "Whether to use sot")
 
 MAX_BATCH_SIZE = 10
-MAX_OUTLINE_SEQ_LEN = 500
+MAX_OUTLINE_SEQ_LEN = 1500
 MAX_CONTENT_SEQ_LEN = 1500
 
 def device_sync(device):
@@ -249,14 +249,14 @@ def generate(
 
     # pad to batch size
     if prompt.size(0) < batch_size:
-        prompt = F.pad(prompt.clone(), (0, 0, 0, batch_size - prompt.size(0)), value=tokenizer.pad_id())
+        prompt = F.pad(prompt.clone(), (0, 0, 0, batch_size - prompt.size(0)), value=tokenizer.eos_id())
 
     # print("batch_size", batch_size)
     # print("max_seq_len", max_seq_len)
 
     device, dtype = prompt.device, prompt.dtype
     with torch.device(device):
-        model.setup_caches(max_batch_size=batch_size, max_seq_length=max_seq_len)
+        model.setup_caches(max_batch_size=batch_size, max_seq_length=1500)
 
     # create an empty tensor of the expected final shape and fill in the current tokens
     empty = torch.ones(batch_size, max_seq_len, dtype=dtype, device=device)
