@@ -67,7 +67,7 @@ flags.DEFINE_string("output_file", None, "output file")
 flags.DEFINE_string("positional_encoding_mode", "const-40", "positional encoding mode")
 flags.DEFINE_boolean("sot", False, "Whether to use sot")
 
-MAX_BATCH_SIZE = 8
+MAX_BATCH_SIZE = 1
 MAX_OUTLINE_SEQ_LEN = 1500
 MAX_CONTENT_SEQ_LEN = 1500
 
@@ -354,6 +354,8 @@ def generate(
 def preprocess_prompt(prompt: str) -> str:
     return prompt.split("<|im_start|>user\n")[1].split("<|im_end|>")[0]
 
+def gemma_instruct_prompt(prompt: str) -> str:
+    return prompt.split("<|im_start|>system\n")[1].split("<|im_end|>")[0]
 
 def generate_outline(
     tokenizer: SentencePieceProcessor,
@@ -874,7 +876,8 @@ def main_fn(
     log_file = open(output_file, "a")
     for name, config in name_to_configs.items():
         prompt = config
-        encoded = encode_tokens(tokenizer, prompt, bos=True, device=device)
+        prompt = preprocess_prompt(prompt)
+        encoded = encode_tokens(tokenizer, prompt, use_chat=True, bos=True, device=device)
         prompt_length = encoded.size(0)
 
         aggregate_metrics = {
