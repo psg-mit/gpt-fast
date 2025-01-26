@@ -260,7 +260,7 @@ def generate(
 
     # pad to batch size
     if prompt.size(0) < batch_size:
-        prompt = F.pad(prompt.clone(), (0, 0, 0, batch_size - prompt.size(0)), value=tokenizer.pad_id())
+        prompt = F.pad(prompt.clone(), (0, 0, 0, batch_size - prompt.size(0)), value=tokenizer.eos_id())
 
     # print("batch_size", batch_size)
     # print("max_seq_len", max_seq_len)
