@@ -67,7 +67,7 @@ flags.DEFINE_string("output_file", None, "output file")
 flags.DEFINE_string("positional_encoding_mode", "const-40", "positional encoding mode")
 flags.DEFINE_boolean("sot", False, "Whether to use sot")
 
-MAX_BATCH_SIZE = 1
+MAX_BATCH_SIZE = 10
 MAX_OUTLINE_SEQ_LEN = 1500
 MAX_CONTENT_SEQ_LEN = 1500
 
@@ -876,7 +876,7 @@ def main_fn(
     log_file = open(output_file, "a")
     for name, config in name_to_configs.items():
         prompt = config
-        prompt = preprocess_prompt(prompt)
+        # prompt = preprocess_prompt(prompt)
         encoded = encode_tokens(tokenizer, prompt, use_chat=True, bos=True, device=device)
         prompt_length = encoded.size(0)
 
@@ -951,6 +951,8 @@ def main_fn(
                     decode_time = points_decode_time + outline_decode_time
                     tokens_generated = point_tokens.size(-1)
                 else:
+                    prompt = preprocess_prompt(prompt)
+                    encoded = encode_tokens(tokenizer, prompt, use_chat=True, bos=True, device=device)
                     # Just do regular generation
                     y, (decode_tokens, decode_time) = generate(
                         model,
