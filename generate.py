@@ -241,6 +241,9 @@ def generate(
     """
 
     is_speculative = draft_model is not None
+    if prompt.shape[1] > max_seq_len:
+        print("Prompt is longer than max_seq_len, truncating")
+        prompt = prompt[:, :max_seq_len]
     # create an empty tensor of the expected final shape and fill in the current tokens
     T = prompt.size(-1)
     num_prompt_tokens = T
@@ -840,14 +843,22 @@ def main_fn(
         # insert .{eval_rank} before the extension
         output_file = Path(output_file)
         output_file = output_file.with_name(output_file.stem + f".{eval_rank}" + output_file.suffix)
-    
-    try:
+
+    if os.path.exists(output_file):
         with open(output_file, "r") as f:
-            pass
-        raise ValueError(f"Output file {output_file} already exists! Exiting.")
-    except:
-        with open(output_file, "w") as f:
-            pass
+            current_outputs = [json.loads(x) for x in f.readlines()]
+        already_done = set([x["name"] for x in current_outputs])
+
+        name_to_configs = {k: v for k, v in name_to_configs.items() if k not in already_done}
+    
+    # try:
+    #     with open(output_file, "r") as f:
+    #         pass
+    #     raise ValueError(f"Output file {output_file} already exists! Exiting.")
+    # except:
+    #     with open(output_file, "r") as f:
+    #         current_outputs = [json.loads(x) for x in f.readlines()]
+    #         already_done = set([x["name"] for x in current_outputs])
 
     log_file = open(output_file, "a")
     for name, config in name_to_configs.items():
