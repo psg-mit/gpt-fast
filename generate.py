@@ -66,8 +66,8 @@ flags.DEFINE_string("model_name", None, "model name")
 flags.DEFINE_string("output_file", None, "output file")
 flags.DEFINE_string("positional_encoding_mode", "const-40", "positional encoding mode")
 flags.DEFINE_boolean("sot", False, "Whether to use sot")
+flags.DEFINE_integer("batch_size", 1, "Batch size")
 
-MAX_BATCH_SIZE = 10
 MAX_OUTLINE_SEQ_LEN = 1500
 MAX_CONTENT_SEQ_LEN = 1500
 
@@ -239,6 +239,7 @@ def generate(
     tokenizer: SentencePieceProcessor,
     prompt: torch.Tensor,
     max_seq_len: int,
+    batch_size: int = 1,
     *,
     interactive: bool,
     draft_model: Transformer,
@@ -256,7 +257,6 @@ def generate(
     T = prompt.size(-1)
     num_prompt_tokens = T
     # batch_size = prompt.size(0)
-    batch_size = MAX_BATCH_SIZE
 
     # pad to batch size
     if prompt.size(0) < batch_size:
@@ -352,6 +352,7 @@ def generate(
 # Input prompt is already in chat format, so need to preprocess it to just the prompt
 # Assumes it is in the chat template
 def preprocess_prompt(prompt: str) -> str:
+    print(prompt)
     return prompt.split("<|im_start|>user\n")[1].split("<|im_end|>")[0]
 
 def gemma_instruct_prompt(prompt: str) -> str:
@@ -361,6 +362,7 @@ def generate_outline(
     tokenizer: SentencePieceProcessor,
     model: Transformer,
     max_seq_len: int,
+    batch_size: int,
     device: str,
     draft_model: Transformer,
     speculate_k: int,
@@ -391,6 +393,7 @@ def generate_outline(
         tokenizer,
         outline_encoded,
         MAX_OUTLINE_SEQ_LEN,
+        batch_size=batch_size,
         draft_model=draft_model,
         speculate_k=speculate_k,
         interactive=interactive,
@@ -423,6 +426,7 @@ def generate_point_content(
     tokenizer: SentencePieceProcessor,
     model: Transformer,
     max_seq_len: int,
+    batch_size: int,
     device: str,
     draft_model: Transformer,
     speculate_k: int,
@@ -479,6 +483,7 @@ def generate_point_content(
         tokenizer,
         all_point_prompts,
         MAX_CONTENT_SEQ_LEN,
+        batch_size=batch_size,
         draft_model=draft_model,
         speculate_k=speculate_k,
         interactive=interactive,
@@ -541,6 +546,7 @@ def sot_generate(
     tokenizer: SentencePieceProcessor,
     prompt: str,
     max_seq_len: int,
+    batch_size: int,
     *,
     interactive: bool,
     draft_model: Transformer,
@@ -554,8 +560,6 @@ def sot_generate(
     temperature = sampling_kwargs["temperature"]
     top_k = sampling_kwargs["top_k"]
 
-    prompt = preprocess_prompt(prompt)
-
     t0 = time.time()
 
     # Step 1: Generate outline
@@ -563,6 +567,7 @@ def sot_generate(
         tokenizer,
         model,
         max_seq_len,
+        batch_size,
         device,
         draft_model,
         speculate_k,
@@ -605,9 +610,9 @@ def sot_generate(
     print("After deduplication, got a total of", len(point_outlines), "points")
 
     # cap at max batch size
-    if len(point_outlines) > MAX_BATCH_SIZE:
+    if len(point_outlines) > batch_size:
         print("Capping at max batch size")
-    point_outlines = point_outlines[:MAX_BATCH_SIZE]
+    point_outlines = point_outlines[:batch_size]
 
     # recontruct outline
     outline = "\n".join([f"{point+1}. {point_outline}" for point, point_outline in enumerate(point_outlines)])
@@ -619,6 +624,7 @@ def sot_generate(
         tokenizer,
         model,
         max_seq_len,
+        batch_size,
         device,
         draft_model,
         speculate_k,
@@ -716,6 +722,7 @@ def main_fn(
     interactive: bool = False,
     num_samples: int = 5,
     max_seq_len: int = 100,
+    batch_size: int = 1,
     top_k: int = 200,
     temperature: float = 0.8,
     checkpoint_path: Optional[str] = None,
@@ -876,9 +883,9 @@ def main_fn(
     log_file = open(output_file, "a")
     for name, config in name_to_configs.items():
         prompt = config
-        # prompt = preprocess_prompt(prompt)
+        prompt = preprocess_prompt(prompt)
         encoded = encode_tokens(tokenizer, prompt, use_chat=True, bos=True, device=device)
-        prompt_length = encoded.size(0)
+        # prompt_length = encoded.size(0)
 
         aggregate_metrics = {
             "tokens_per_sec": [],
@@ -940,6 +947,7 @@ def main_fn(
                         tokenizer,
                         prompt,
                         max_seq_len,
+                        batch_size=batch_size,
                         draft_model=draft_model,
                         speculate_k=speculate_k,
                         interactive=interactive,
@@ -951,14 +959,13 @@ def main_fn(
                     decode_time = points_decode_time + outline_decode_time
                     tokens_generated = point_tokens.size(-1)
                 else:
-                    prompt = preprocess_prompt(prompt)
-                    encoded = encode_tokens(tokenizer, prompt, use_chat=True, bos=True, device=device)
                     # Just do regular generation
                     y, (decode_tokens, decode_time) = generate(
                         model,
                         tokenizer,
                         encoded,
                         max_seq_len,
+                        batch_size=1,
                         draft_model=draft_model,
                         speculate_k=speculate_k,
                         interactive=interactive,
@@ -1036,6 +1043,7 @@ def main(argv):
         FLAGS.interactive,
         FLAGS.num_samples,
         FLAGS.max_seq_len,
+        FLAGS.batch_size,
         FLAGS.top_k,
         FLAGS.temperature,
         FLAGS.checkpoint_path,
