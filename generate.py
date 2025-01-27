@@ -241,9 +241,7 @@ def generate(
     """
 
     is_speculative = draft_model is not None
-    if prompt.shape[1] > max_seq_len:
-        print("Prompt is longer than max_seq_len, truncating")
-        prompt = prompt[:, :max_seq_len]
+
     # create an empty tensor of the expected final shape and fill in the current tokens
     T = prompt.size(-1)
     num_prompt_tokens = T
@@ -442,6 +440,10 @@ def generate_point_content(
         starter = f"{point}. {point_outline}"
         point_prompt_encoded = encode_tokens(tokenizer, point_prompt, use_chat=True, starter= starter, bos=True, device=device)
 
+        if point_prompt_encoded.size(1) > MAX_CONTENT_SEQ_LEN:
+            print("Prompt is longer than max_seq_len, truncating")
+            point_prompt_encoded = point_prompt_encoded[:, :MAX_CONTENT_SEQ_LEN]
+
         all_point_starters.append(encode_tokens(tokenizer, starter, device=device)[0])
         all_point_prompts.append(point_prompt_encoded)
 
@@ -452,6 +454,7 @@ def generate_point_content(
 
     # pad left 
     for i in range(len(all_point_prompts)):
+        
         all_point_prompts[i] = F.pad(all_point_prompts[i], (max_prompt_len - all_point_prompts[i].size(1), 0), value=tokenizer.pad_id())
 
     all_point_prompts = torch.cat(all_point_prompts, dim=0)
